@@ -1,0 +1,622 @@
+
+
+
+python v9_1_daily_inference.py `
+  --engineered-features "C:\Temp\v81\cesmlc_v8_1_training_data\cesmlc_v8_1_engineered_features_used_for_training.csv" `
+  --model-artifact "C:\Temp\v91\model_outputs\catboost\cesmlc_v9_catboost_problem_state_model_artifact.pkl" `
+  --out-dir "C:\Temp\v91\daily_outputs" `
+  --gate-mode balanced `
+  --problem-prob-threshold 0.90 `
+  --final-score-threshold 95 `
+  --min-model-confidence 0.70 `
+  --report-top-n 100 `
+  --per-cluster-top-n 20 `
+  --top-n 500
+
+
+#!/usr/bin/env python
+"""
+CESMLC V9 - daily inference with post-model RCA/reference enrichment
+====================================================================
+
+Clean separation:
+1. ML scores temporal/behavioral engineered features.
+2. RCA/reference enrichment runs after model scoring and only on abnormal/review rows.
+3. Final report is grouped by PRIMARY_ANOMALY_CLUSTER and PRIMARY_ABNORMAL_FEATURE.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import pickle
+import sys
+import time
+import warnings
+from pathlib import Path
+from typing import Any, Dict, Iterable, List, Optional, Tuple
+
+import numpy as np
+import pandas as pd
+
+warnings.filterwarnings("ignore")
+
+SCRIPT_VERSION = "9.1.0-daily-inference-with-seed-sanity-gate"
+RUN_START_TIME = time.time()
+
+PROBLEM_LABELS = {
+    "HIGH_FREQUENCY_DIFFERENT_VALUES",
+    "REAL_BACK_AND_FORTH_INSTABILITY",
+    "RARE_UNCOMMON_CHANGES",
+    "FLUCTUATING_FALLBACK_TO_DEFAULT",
+    "LONG_TERM_FALLBACK_TO_DEFAULT",
+}
+NORMAL_LABELS = {
+    "NORMAL_LOW_INFORMATION",
+    "NORMAL_STABLE_SOURCE",
+    "NORMAL_STABLE_SOURCE_CHANGE",
+    "NORMAL_COORDINATED_MULTI_FIELD_CHANGE",
+    "NORMAL_BULK_OR_REFRESH_PATTERN",
+}
+DEFAULT_FEATURES = [
+    "PHYSICALCELLID", "CELLNAME", "CELLTYPE", "ANTENNALAT", "ANTENNALON",
+    "ANTENNAORIENTATION", "ANTENNAOPENING", "ANTENNAHORIZONTALRANGE",
+    "ANTENNABASEALTITUDE", "GEOTYPE", "RADIUS1", "SRVNGAREAAVERAGEALT",
+    "SRVNGAREAAVGALTUNCERT", "SUPPORTEDTECHNOLOGIES",
+]
+
+
+def elapsed_text() -> str:
+    seconds = int(time.time() - RUN_START_TIME)
+    h, rem = divmod(seconds, 3600)
+    m, s = divmod(rem, 60)
+    return f"{h:02d}:{m:02d}:{s:02d}"
+
+
+def log(message: str, indent: int = 0) -> None:
+    print(f"[{time.strftime('%H:%M:%S')} | +{elapsed_text()}] {'  '*max(0, indent)}{message}", flush=True)
+
+
+def header(title: str) -> None:
+    print("\n" + "=" * 100, flush=True)
+    log(title)
+    print("=" * 100, flush=True)
+
+
+def clean_col_name(c: object) -> str:
+    return str(c).strip().strip('"').upper()
+
+
+def safe_numeric(series: Any, default: float = 0.0) -> pd.Series:
+    if not isinstance(series, pd.Series):
+        series = pd.Series(series)
+    return pd.to_numeric(series, errors="coerce").replace([np.inf, -np.inf], np.nan).fillna(default)
+
+
+def percentile_rank(series: pd.Series) -> pd.Series:
+    s = safe_numeric(series)
+    if len(s) == 0:
+        return s
+    if s.nunique(dropna=False) <= 1:
+        return pd.Series(np.ones(len(s)) * 50.0, index=s.index)
+    return s.rank(method="average", pct=True) * 100.0
+
+
+def short_value(v: object, max_len: int = 80) -> str:
+    if pd.isna(v):
+        return "<missing>"
+    s = str(v)
+    return s if len(s) <= max_len else s[: max_len - 3] + "..."
+
+
+def sanitize_label(x: object) -> str:
+    return str(x or "").strip().upper()
+
+
+def load_artifact(path: Path) -> Dict[str, Any]:
+    if not path.exists():
+        raise FileNotFoundError(f"Model artifact not found: {path}")
+    with path.open("rb") as f:
+        artifact = pickle.load(f)
+    required = {"model", "features", "backend"}
+    missing = [k for k in required if k not in artifact]
+    if missing:
+        raise ValueError(f"Model artifact missing required keys: {missing}")
+    return artifact
+
+
+def build_or_load_features(args: argparse.Namespace, out_dir: Path) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+    if args.engineered_features:
+        p = Path(args.engineered_features).expanduser()
+        if not p.exists():
+            raise FileNotFoundError(f"Engineered features file not found: {p}")
+        log(f"Loading existing engineered features: {p}")
+        df = pd.read_csv(p, low_memory=False)
+        df.columns = [clean_col_name(c) for c in df.columns]
+        return df, {"engineered_features_input": str(p), "engineered_feature_rows": int(len(df))}
+    if not args.input:
+        raise ValueError("Either --input or --engineered-features is required.")
+    script_dir = Path(__file__).resolve().parent
+    if str(script_dir) not in sys.path:
+        sys.path.insert(0, str(script_dir))
+    from v9_feature_engineering import build_feature_table  # type: ignore
+    # During inference, reference mode is still none here; RCA reference enrichment happens after ML scoring.
+    setattr(args, "reference_mode", "none")
+    feature_out = out_dir / "feature_engineering"
+    df, info = build_feature_table(Path(args.input).expanduser(), feature_out, args)
+    df.to_csv(feature_out / "cesmlc_v9_engineered_features_for_inference.csv", index=False)
+    return df, info
+
+
+def prepare_X(df: pd.DataFrame, features: List[str], categorical_features: List[str]) -> pd.DataFrame:
+    X = df.copy()
+    for c in features:
+        if c not in X.columns:
+            X[c] = np.nan
+    X = X[features].copy()
+    for c in categorical_features:
+        if c in X.columns:
+            X[c] = X[c].fillna("__MISSING__").astype(str)
+    for c in features:
+        if c not in set(categorical_features):
+            X[c] = pd.to_numeric(X[c], errors="coerce")
+    return X
+
+
+def predict_dataframe(artifact: Dict[str, Any], df: pd.DataFrame) -> pd.DataFrame:
+    model = artifact["model"]
+    features = [clean_col_name(c) for c in artifact.get("features", [])]
+    categorical = [clean_col_name(c) for c in artifact.get("categorical_features", [])]
+    backend = str(artifact.get("backend", "")).lower()
+    X = prepare_X(df, features, categorical)
+    pred = np.asarray(model.predict(X)).reshape(-1)
+    pred = np.array([sanitize_label(x) for x in pred])
+    classes = [sanitize_label(x) for x in artifact.get("classes", [])]
+    if not classes:
+        if hasattr(model, "classes_"):
+            classes = [sanitize_label(x) for x in model.classes_]
+        elif hasattr(model, "named_steps") and hasattr(model.named_steps.get("model"), "classes_"):
+            classes = [sanitize_label(x) for x in model.named_steps["model"].classes_]
+    proba = None
+    try:
+        proba = model.predict_proba(X)
+    except Exception:
+        proba = None
+    out = pd.DataFrame({"MODEL_PREDICTED_LABEL": pred})
+    if proba is not None and classes:
+        for i, cls in enumerate(classes):
+            if i < proba.shape[1]:
+                out[f"PRED_PROBA_{cls}"] = proba[:, i]
+        prob_idx = [i for i, cls in enumerate(classes) if cls in PROBLEM_LABELS]
+        out["ML_PROBLEM_PROBABILITY"] = proba[:, prob_idx].sum(axis=1) if prob_idx else 0.0
+        out["MODEL_CONFIDENCE"] = proba.max(axis=1)
+    else:
+        out["ML_PROBLEM_PROBABILITY"] = out["MODEL_PREDICTED_LABEL"].isin(PROBLEM_LABELS).astype(float)
+        out["MODEL_CONFIDENCE"] = 1.0
+    return out
+
+
+def add_temporal_score(scored: pd.DataFrame) -> pd.DataFrame:
+    out = scored.copy()
+    n = len(out)
+    def num(col: str, default: float = 0.0) -> pd.Series:
+        return safe_numeric(out[col], default) if col in out.columns else pd.Series(np.ones(n) * default, index=out.index)
+    score = pd.Series(np.zeros(n), index=out.index, dtype=float)
+    score += np.minimum(20.0, 1.8 * num("SOURCE_CHANGE_DAYS_COUNT"))
+    score += np.minimum(14.0, 0.9 * num("SOURCE_CHANGE_COUNT"))
+    score += np.minimum(12.0, 3.0 * np.maximum(num("DISTINCT_SOURCE_VALUES_30D") - 1, 0))
+    score += 12.0 * (num("LATEST_SOURCE_INVALID_RANGE_FLAG") > 0).astype(int)
+    score += 8.0 * (num("LATEST_SOURCE_IS_DEFAULT_FLAG") > 0).astype(int)
+    score += np.minimum(10.0, 3.0 * num("SOURCE_A_B_A_REVERT_COUNT"))
+    score += np.minimum(10.0, 3.0 * num("SOURCE_REVERSE_TRANSITION_COUNT"))
+    score += np.minimum(8.0, 2.0 * num("SOURCE_SAME_DAY_CONFLICT_DAYS"))
+    score += np.minimum(8.0, 0.5 * num("FEATURE_CRITICALITY_WEIGHT", 5.0))
+    score -= np.minimum(12.0, 35.0 * num("MAX_CANDIDATE_BULK_CHANGE_RATIO"))
+    out["TEMPORAL_OPERATIONAL_SCORE"] = score.clip(lower=0)
+    out["TEMPORAL_OPERATIONAL_PERCENTILE"] = percentile_rank(out["TEMPORAL_OPERATIONAL_SCORE"])
+    out["ML_FINAL_PROBLEM_SCORE"] = (
+        100.0 * safe_numeric(out.get("ML_PROBLEM_PROBABILITY", 0), 0)
+        + 0.35 * safe_numeric(out["TEMPORAL_OPERATIONAL_SCORE"], 0)
+        + 0.15 * safe_numeric(out["TEMPORAL_OPERATIONAL_PERCENTILE"], 0)
+    )
+    return out
+
+
+
+def apply_prediction_sanity_gate(scored: pd.DataFrame, args: argparse.Namespace) -> pd.DataFrame:
+    """Reject class predictions that contradict the temporal evidence.
+
+    This protects inference when an older weak-supervised artifact learned overly broad
+    seed rules. It does not create labels; it only prevents impossible/unsupported
+    class names from entering the abnormal report.
+    """
+    out = scored.copy()
+    label = out.get("MODEL_PREDICTED_LABEL", pd.Series([""] * len(out), index=out.index)).astype(str).map(sanitize_label)
+    change_count = safe_numeric(out.get("SOURCE_CHANGE_COUNT", 0), 0)
+    change_days = safe_numeric(out.get("SOURCE_CHANGE_DAYS_COUNT", 0), 0)
+    distinct_vals = safe_numeric(out.get("DISTINCT_SOURCE_VALUES_30D", 0), 0)
+    mode_share = safe_numeric(out.get("MODE_SOURCE_VALUE_SHARE_PERCENT", 100), 100)
+    aba = safe_numeric(out.get("SOURCE_A_B_A_REVERT_COUNT", 0), 0)
+    reverse = safe_numeric(out.get("SOURCE_REVERSE_TRANSITION_COUNT", 0), 0)
+    latest_default = safe_numeric(out.get("LATEST_SOURCE_IS_DEFAULT_FLAG", 0), 0)
+    prev_default = safe_numeric(out.get("PREVIOUS_NONLATEST_SOURCE_IS_DEFAULT_FLAG", 0), 0)
+    latest_days = safe_numeric(out.get("LATEST_SOURCE_VALUE_DAYS", 0), 0)
+    bulk = safe_numeric(out.get("MAX_CANDIDATE_BULK_CHANGE_RATIO", 0), 0)
+    multi = safe_numeric(out.get("MAX_MULTI_FIELD_SAME_DAY_CHANGE_COUNT", 0), 0)
+    invalid = safe_numeric(out.get("LATEST_SOURCE_INVALID_RANGE_FLAG", 0), 0)
+    conflict = safe_numeric(out.get("SOURCE_SAME_DAY_CONFLICT_DAYS", 0), 0)
+    delta_abs = safe_numeric(out.get("VALUE_DELTA_LATEST_PREVIOUS", 0), 0).abs()
+
+    pass_gate = pd.Series(True, index=out.index)
+    reason = pd.Series("", index=out.index, dtype="object")
+
+    real_mask = label.eq("REAL_BACK_AND_FORTH_INSTABILITY")
+    real_ok = (
+        ((aba >= int(args.sanity_min_aba_for_backforth)) | (reverse >= int(args.sanity_min_reverses_for_backforth)))
+        & (change_count >= int(args.sanity_backforth_min_change_count))
+        & (change_days >= int(args.sanity_backforth_min_change_days))
+        & (distinct_vals <= int(args.sanity_backforth_max_distinct_values))
+    )
+    bad = real_mask & ~real_ok
+    pass_gate.loc[bad] = False
+    reason.loc[bad] = "REJECT_REAL_BACK_FORTH_NO_TRUE_REVERSE_OR_ABA"
+
+    high_mask = label.eq("HIGH_FREQUENCY_DIFFERENT_VALUES")
+    high_ok = (
+        (change_days >= int(args.sanity_high_frequency_days))
+        & (distinct_vals >= int(args.sanity_high_frequency_distinct_values))
+        & (mode_share < float(args.sanity_high_frequency_max_mode_share))
+    )
+    bad = high_mask & ~high_ok
+    pass_gate.loc[bad] = False
+    reason.loc[bad] = "REJECT_HIGH_FREQUENCY_INSUFFICIENT_CHANGE_DAYS_OR_DISTINCT_VALUES"
+
+    fallback_mask = label.isin(["FLUCTUATING_FALLBACK_TO_DEFAULT", "LONG_TERM_FALLBACK_TO_DEFAULT"])
+    fallback_ok = (
+        (latest_default == 1)
+        & (latest_days >= int(args.sanity_default_min_days))
+        & ((prev_default == 0) | (change_count >= 1))
+    )
+    bad = fallback_mask & ~fallback_ok
+    pass_gate.loc[bad] = False
+    reason.loc[bad] = "REJECT_FALLBACK_NO_LATEST_DEFAULT_EVIDENCE"
+
+    rare_mask = label.eq("RARE_UNCOMMON_CHANGES")
+    rare_ok = (
+        bool(args.enable_rare_inference_gate)
+        & (change_count >= int(args.sanity_rare_min_change_count))
+        & (change_days >= int(args.sanity_rare_min_change_days))
+        & (change_days <= int(args.sanity_rare_max_change_days))
+        & (bulk <= float(args.sanity_rare_max_bulk_change_ratio))
+        & (multi <= int(args.sanity_rare_max_multi_field_same_day_count))
+        & ((invalid > 0) | (conflict > 0) | (delta_abs >= float(args.sanity_rare_min_abs_delta)))
+    )
+    bad = rare_mask & ~rare_ok
+    pass_gate.loc[bad] = False
+    reason.loc[bad] = "REJECT_RARE_UNCOMMON_WEAK_OR_ONE_TIME_CHANGE"
+
+    out["SANITY_GATE_PASS"] = pass_gate.astype(int)
+    out["SANITY_GATE_REJECT_REASON"] = reason
+    return out
+
+def abnormal_feature_filter(scored: pd.DataFrame, args: argparse.Namespace) -> pd.Series:
+    pred_problem = scored["MODEL_PREDICTED_LABEL"].astype(str).map(sanitize_label).isin(PROBLEM_LABELS)
+    prob_ok = safe_numeric(scored.get("ML_PROBLEM_PROBABILITY", 0), 0) >= float(args.problem_prob_threshold)
+    score_ok = safe_numeric(scored.get("ML_FINAL_PROBLEM_SCORE", 0), 0) >= float(args.final_score_threshold)
+    conf_ok = safe_numeric(scored.get("MODEL_CONFIDENCE", 0), 0) >= float(args.min_model_confidence)
+    if args.gate_mode == "strict":
+        return pred_problem & prob_ok & score_ok & conf_ok
+    if args.gate_mode == "review":
+        return (pred_problem & conf_ok) | prob_ok | score_ok
+    # balanced default: predicted problem plus confidence and one strong severity condition.
+    return pred_problem & conf_ok & (prob_ok | score_ok)
+
+
+def join_unique(values: Iterable[Any], max_items: int = 20) -> str:
+    out: List[str] = []
+    for v in values:
+        s = str(v)
+        if s and s.lower() != "nan" and s not in out:
+            out.append(s)
+        if len(out) >= max_items:
+            break
+    return ";".join(out)
+
+
+def recommend_next_check(r: pd.Series) -> str:
+    label = str(r.get("PRIMARY_ANOMALY_CLUSTER", "")).upper()
+    feature = str(r.get("PRIMARY_ABNORMAL_FEATURE", ""))
+    compat = str(r.get("DATA_SOURCE_COMPATIBILITY", "NOT_CHECKED"))
+    if "FALLBACK" in label:
+        return f"Check {feature} fallback against RAN references, planned activity/COW/site rebuild, and upstream feed defaulting. Reference compatibility={compat}."
+    if label == "REAL_BACK_AND_FORTH_INSTABILITY":
+        return f"Trace {feature} across source load jobs and automation history; look for competing overwrites or reversions."
+    if label == "HIGH_FREQUENCY_DIFFERENT_VALUES":
+        return f"Trace {feature} source feed joins/imports; verify whether frequent changes match planned network work."
+    if label == "RARE_UNCOMMON_CHANGES":
+        return f"Use RCA/reference/ticket checks for {feature}; verify planned activity and whether value exists in RAN source-of-truth."
+    return f"Review {feature} temporal evidence and run RCA checks before action."
+
+
+def build_ecgi_summary(abnormal_features: pd.DataFrame) -> pd.DataFrame:
+    if abnormal_features.empty:
+        return pd.DataFrame()
+    af = abnormal_features.copy().sort_values(["ECGI", "ML_FINAL_PROBLEM_SCORE"], ascending=[True, False])
+    top = af.groupby("ECGI", as_index=False).head(1).copy().rename(columns={
+        "FEATURE": "PRIMARY_ABNORMAL_FEATURE",
+        "MODEL_PREDICTED_LABEL": "PRIMARY_ANOMALY_CLUSTER",
+        "MODEL_CONFIDENCE": "PRIMARY_MODEL_CONFIDENCE",
+        "ML_PROBLEM_PROBABILITY": "PRIMARY_ML_PROBLEM_PROBABILITY",
+        "ML_FINAL_PROBLEM_SCORE": "PRIMARY_ML_FINAL_PROBLEM_SCORE",
+    })
+    agg = af.groupby("ECGI", as_index=False).agg(
+        ABNORMAL_FEATURE_COUNT=("FEATURE", "nunique"),
+        ABNORMAL_FEATURE_ROW_COUNT=("FEATURE", "size"),
+        ECGI_ML_FINAL_PROBLEM_SCORE=("ML_FINAL_PROBLEM_SCORE", "max"),
+        ECGI_AVG_ML_PROBLEM_PROBABILITY=("ML_PROBLEM_PROBABILITY", "mean"),
+        ECGI_MAX_ML_PROBLEM_PROBABILITY=("ML_PROBLEM_PROBABILITY", "max"),
+        ECGI_AVG_MODEL_CONFIDENCE=("MODEL_CONFIDENCE", "mean"),
+        SOURCE_CHANGE_DAYS_COUNT_TOTAL=("SOURCE_CHANGE_DAYS_COUNT", "sum") if "SOURCE_CHANGE_DAYS_COUNT" in af.columns else ("FEATURE", "size"),
+        SOURCE_CHANGE_COUNT_TOTAL=("SOURCE_CHANGE_COUNT", "sum") if "SOURCE_CHANGE_COUNT" in af.columns else ("FEATURE", "size"),
+        MAX_ABNORMAL_DAYS_SINGLE_FEATURE=("SOURCE_CHANGE_DAYS_COUNT", "max") if "SOURCE_CHANGE_DAYS_COUNT" in af.columns else ("FEATURE", "size"),
+        DISTINCT_PROBLEM_CLUSTERS=("MODEL_PREDICTED_LABEL", pd.Series.nunique),
+    )
+    feat_list = af.groupby("ECGI").apply(lambda d: join_unique(d.sort_values("ML_FINAL_PROBLEM_SCORE", ascending=False)["FEATURE"].tolist(), 30)).rename("ABNORMAL_FEATURES").reset_index()
+    detail = af.groupby("ECGI").apply(lambda d: " | ".join(
+        f"{r.FEATURE}:{r.MODEL_PREDICTED_LABEL}:score={float(r.ML_FINAL_PROBLEM_SCORE):.1f}:p={float(r.ML_PROBLEM_PROBABILITY):.2f}:days={int(getattr(r, 'SOURCE_CHANGE_DAYS_COUNT', 0) or 0)}:latest={short_value(getattr(r, 'LATEST_SOURCE_VALUE_RAW', ''), 35)}"
+        for r in d.sort_values("ML_FINAL_PROBLEM_SCORE", ascending=False).head(8).itertuples()
+    )).rename("TOP_FEATURE_DETAILS_WITH_DAYS").reset_index()
+    keep_cols = ["ECGI", "ECGI_LABEL", "REGION", "MARKETCLUSTER", "MARKET", "SUBMARKET", "SERVER_ID", "PRIMARY_ANOMALY_CLUSTER", "PRIMARY_ABNORMAL_FEATURE", "PRIMARY_MODEL_CONFIDENCE", "PRIMARY_ML_PROBLEM_PROBABILITY", "PRIMARY_ML_FINAL_PROBLEM_SCORE", "LATEST_SOURCE_VALUE_RAW", "PREVIOUS_NONLATEST_SOURCE_VALUE_RAW", "SOURCE_CHANGE_DAYS_COUNT", "SOURCE_CHANGE_COUNT", "DISTINCT_SOURCE_VALUES_30D", "LATEST_SOURCE_CHANGE_TEXT", "SOURCE_FIRST_CHANGE_DATE", "SOURCE_LAST_CHANGE_DATE", "DAYS_SINCE_LAST_SOURCE_CHANGE", "DATA_SOURCE_COMPATIBILITY", "REFERENCE_SOURCE_NAME", "REFERENCE_COLUMN", "REFERENCE_VALUE_RAW"]
+    ecgi = agg.merge(top[[c for c in keep_cols if c in top.columns]], on="ECGI", how="left")
+    ecgi = ecgi.merge(feat_list, on="ECGI", how="left").merge(detail, on="ECGI", how="left")
+    ecgi["ECGI_RANKING_SCORE"] = safe_numeric(ecgi["ECGI_ML_FINAL_PROBLEM_SCORE"], 0) + 5.0 * np.maximum(safe_numeric(ecgi["ABNORMAL_FEATURE_COUNT"], 0) - 1, 0) + 10.0 * (safe_numeric(ecgi["DISTINCT_PROBLEM_CLUSTERS"], 0) > 1).astype(int)
+    ecgi["ECGI_PROBLEM_PERCENTILE"] = percentile_rank(ecgi["ECGI_RANKING_SCORE"])
+    ecgi["RECOMMENDED_NEXT_CHECK"] = ecgi.apply(recommend_next_check, axis=1)
+    ecgi = ecgi.sort_values("ECGI_RANKING_SCORE", ascending=False).reset_index(drop=True)
+    ecgi.insert(0, "ECGI_PROBLEM_RANK", np.arange(1, len(ecgi)+1))
+    return ecgi
+
+
+def enrich_reference_rca(abnormal_features: pd.DataFrame, args: argparse.Namespace) -> pd.DataFrame:
+    if abnormal_features.empty:
+        return abnormal_features
+    if not (args.reference_source_dir or args.atoll_master_4g or args.ericsson_5g_master_data or args.cssng_data_addition or args.atoll_cells5g):
+        return abnormal_features
+    script_dir = Path(__file__).resolve().parent
+    if str(script_dir) not in sys.path:
+        sys.path.insert(0, str(script_dir))
+    for mod_name in ["v82_feature_engineering", "v821_feature_engineering", "v821_fixed_feature_engineering", "v81_feature_engineering"]:
+        try:
+            mod = __import__(mod_name, fromlist=["attach_reference_compatibility", "load_feature_rules"])
+            rules = mod.load_feature_rules(getattr(args, "defaults_json", None)) if hasattr(mod, "load_feature_rules") else {}
+            setattr(args, "disable_reference_compatibility", False)
+            log(f"Applying post-model RCA/reference enrichment using {mod_name}", indent=1)
+            out = mod.attach_reference_compatibility(abnormal_features, rules, args)
+            out.columns = [clean_col_name(c) for c in out.columns]
+            return out
+        except Exception as exc:
+            last = exc
+            continue
+    log(f"Warning: RCA/reference enrichment failed; continuing without it. Last error: {last}", indent=1)
+    return abnormal_features
+
+
+def write_jsonl(df: pd.DataFrame, path: Path, max_rows: int) -> None:
+    with path.open("w", encoding="utf-8") as f:
+        for _, r in df.head(max_rows).iterrows():
+            obj = {str(k): (None if pd.isna(v) else v) for k, v in r.to_dict().items()}
+            f.write(json.dumps(obj, default=str) + "\n")
+
+
+def create_plots(out_dir: Path, scored: pd.DataFrame, abnormal: pd.DataFrame, ecgi: pd.DataFrame, args: argparse.Namespace) -> pd.DataFrame:
+    if args.no_plots:
+        return pd.DataFrame([{"PLOT_FILE": "", "DESCRIPTION": "plots skipped"}])
+    try:
+        import matplotlib.pyplot as plt
+    except Exception as exc:
+        return pd.DataFrame([{"PLOT_FILE": "", "DESCRIPTION": f"plotting unavailable: {exc}"}])
+    plots_dir = out_dir / "plots"; plots_dir.mkdir(parents=True, exist_ok=True)
+    rows=[]
+    def save(fig, name, desc):
+        fp=plots_dir/name; fig.savefig(fp, dpi=160, bbox_inches="tight"); plt.close(fig); rows.append({"PLOT_FILE": str(fp), "DESCRIPTION": desc})
+    for col, name, title in [("ML_FINAL_PROBLEM_SCORE","01_final_problem_score_distribution.png","ML final problem score distribution"),("ML_PROBLEM_PROBABILITY","02_problem_probability_distribution.png","ML problem probability distribution"),("MODEL_CONFIDENCE","03_model_confidence_distribution.png","Model confidence distribution"),("TEMPORAL_OPERATIONAL_SCORE","04_temporal_operational_score_distribution.png","Temporal operational score distribution")]:
+        if col in scored.columns:
+            vals=safe_numeric(scored[col], np.nan).dropna()
+            if len(vals):
+                fig,ax=plt.subplots(figsize=(9,6)); ax.hist(vals,bins=60); ax.set_title(title); ax.set_xlabel(col); ax.set_ylabel("Rows"); ax.grid(True,alpha=.3); save(fig,name,title)
+    if not abnormal.empty:
+        counts=abnormal["MODEL_PREDICTED_LABEL"].value_counts().head(12)
+        fig,ax=plt.subplots(figsize=(8,8)); ax.pie(counts.values, labels=counts.index, autopct="%1.1f%%", startangle=90); ax.set_title("Abnormal feature cluster composition"); save(fig,"05_abnormal_cluster_composition_pie.png","Abnormal feature cluster composition")
+        if "FEATURE" in abnormal.columns:
+            pivot=pd.crosstab(abnormal["FEATURE"], abnormal["MODEL_PREDICTED_LABEL"])
+            pivot=pivot.loc[pivot.sum(axis=1).sort_values(ascending=False).head(25).index]
+            if pivot.size:
+                fig,ax=plt.subplots(figsize=(max(9,.7*pivot.shape[1]+6),max(6,.35*pivot.shape[0]+3))); im=ax.imshow(pivot.values,aspect="auto"); ax.set_title("Feature x abnormal cluster heatmap"); ax.set_xticks(np.arange(pivot.shape[1])); ax.set_yticks(np.arange(pivot.shape[0])); ax.set_xticklabels(pivot.columns,rotation=45,ha="right",fontsize=8); ax.set_yticklabels(pivot.index,fontsize=8); fig.colorbar(im,ax=ax,label="Rows"); save(fig,"06_feature_by_abnormal_cluster_heatmap.png","Feature by abnormal cluster heatmap")
+        if {"SOURCE_CHANGE_DAYS_COUNT","ML_FINAL_PROBLEM_SCORE"}.issubset(abnormal.columns):
+            samp=abnormal.sample(n=min(len(abnormal),50000), random_state=42) if len(abnormal)>50000 else abnormal
+            fig,ax=plt.subplots(figsize=(9,7)); sc=ax.scatter(safe_numeric(samp["SOURCE_CHANGE_DAYS_COUNT"],0),safe_numeric(samp["ML_FINAL_PROBLEM_SCORE"],0),s=8,alpha=.35,c=safe_numeric(samp.get("ML_PROBLEM_PROBABILITY",0),0)); fig.colorbar(sc,ax=ax,label="ML_PROBLEM_PROBABILITY"); ax.set_title("Abnormal days vs final score"); ax.set_xlabel("SOURCE_CHANGE_DAYS_COUNT"); ax.set_ylabel("ML_FINAL_PROBLEM_SCORE"); ax.grid(True,alpha=.3); save(fig,"07_abnormal_days_vs_score.png","Abnormal days vs final score")
+    if "ML_PROBLEM_PROBABILITY" in scored.columns and "ECGI" in scored.columns:
+        vals=safe_numeric(scored["ML_PROBLEM_PROBABILITY"],0)
+        thr=[]
+        for t in np.linspace(0,1,101):
+            m=vals>=t
+            thr.append({"THRESHOLD":float(t),"FEATURE_ROWS":int(m.sum()),"ECGIS":int(scored.loc[m,"ECGI"].nunique())})
+        thrdf=pd.DataFrame(thr); thrdf.to_csv(out_dir/"cesmlc_v9_inference_probability_threshold_volume.csv",index=False)
+        fig,ax=plt.subplots(figsize=(10,6)); ax.plot(thrdf["THRESHOLD"],thrdf["FEATURE_ROWS"],label="Feature rows"); ax.plot(thrdf["THRESHOLD"],thrdf["ECGIS"],label="ECGIs"); ax.set_title("Operational volume by probability threshold"); ax.set_xlabel("ML_PROBLEM_PROBABILITY threshold"); ax.set_ylabel("Count"); ax.legend(); ax.grid(True,alpha=.3); save(fig,"08_probability_threshold_volume_curve.png","Operational volume by probability threshold")
+    plot_index=pd.DataFrame(rows); plot_index.to_csv(out_dir/"cesmlc_v9_inference_plot_index.csv",index=False); return plot_index
+
+
+def write_report(out_dir: Path, artifact: Dict[str, Any], feature_info: Dict[str, Any], scored: pd.DataFrame, abnormal: pd.DataFrame, ecgi: pd.DataFrame, grouped_top: pd.DataFrame, plot_index: pd.DataFrame, args: argparse.Namespace) -> None:
+    lines=[]
+    lines.append("# CESMLC V9 Daily ML Inference Report")
+    lines.append("")
+    lines.append(f"Inference script version: `{SCRIPT_VERSION}`")
+    lines.append(f"Model artifact version: `{artifact.get('script_version','')}`")
+    lines.append(f"Backend: `{artifact.get('backend','')}`")
+    lines.append("")
+    lines.append("## Run summary")
+    lines.append(f"- Total ECGI-feature rows scored: **{len(scored):,}**")
+    lines.append(f"- Abnormal feature rows after gate: **{len(abnormal):,}**")
+    lines.append(f"- Abnormal ECGIs after gate: **{len(ecgi):,}**")
+    lines.append(f"- Gate mode: `{args.gate_mode}`")
+    lines.append(f"- Problem probability threshold: `{args.problem_prob_threshold}`")
+    lines.append(f"- Final score threshold: `{args.final_score_threshold}`")
+    lines.append(f"- Minimum confidence threshold: `{args.min_model_confidence}`")
+    lines.append(f"- Report top N: `{args.report_top_n}`, per-cluster top N: `{args.per_cluster_top_n}`")
+    lines.append("")
+    if feature_info:
+        lines.append("## Feature-building context")
+        for k in ["window_start_date","window_end_date","candidate_mode","selected_candidate_ecgis","engineered_feature_rows","feature_count","engineered_features_input"]:
+            if k in feature_info: lines.append(f"- {k}: `{feature_info.get(k)}`")
+        lines.append("")
+    if not abnormal.empty:
+        lines.append("## Abnormal cluster distribution")
+        for label,count in abnormal["MODEL_PREDICTED_LABEL"].value_counts().items():
+            lines.append(f"- **{label}**: {int(count):,}")
+        lines.append("")
+    if not grouped_top.empty:
+        lines.append("## Grouped top ECGIs for review")
+        for cluster, d in grouped_top.groupby("PRIMARY_ANOMALY_CLUSTER", sort=False):
+            lines.append(f"### {cluster}")
+            for _,r in d.iterrows():
+                lines.append(
+                    f"- rank={r.get('ECGI_PROBLEM_RANK','')} | ECGI={r.get('ECGI','')} | server={r.get('SERVER_ID','')} | market={r.get('MARKET','')} | "
+                    f"primary_feature={r.get('PRIMARY_ABNORMAL_FEATURE','')} | abnormal_days={r.get('MAX_ABNORMAL_DAYS_SINGLE_FEATURE','')} | "
+                    f"change_events={r.get('SOURCE_CHANGE_COUNT_TOTAL','')} | features={r.get('ABNORMAL_FEATURES','')} | "
+                    f"score={float(r.get('ECGI_RANKING_SCORE',0) or 0):.1f} | p={float(r.get('PRIMARY_ML_PROBLEM_PROBABILITY',0) or 0):.3f} | "
+                    f"next={r.get('RECOMMENDED_NEXT_CHECK','')}"
+                )
+            lines.append("")
+    if plot_index is not None and not plot_index.empty:
+        lines.append("## Plots")
+        for _,r in plot_index.head(30).iterrows():
+            lines.append(f"- `{r.get('PLOT_FILE','')}` â {r.get('DESCRIPTION','')}")
+    (out_dir/"cesmlc_v9_inference_report.md").write_text("\n".join(lines), encoding="utf-8")
+
+
+def run_inference(args: argparse.Namespace) -> None:
+    out_dir=Path(args.out_dir).expanduser(); out_dir.mkdir(parents=True, exist_ok=True)
+    header("CESMLC V9 DAILY ML INFERENCE")
+    artifact=load_artifact(Path(args.model_artifact).expanduser())
+    log(f"Loaded artifact backend={artifact.get('backend')} features={len(artifact.get('features', [])):,}", indent=1)
+    features_df, feature_info = build_or_load_features(args,out_dir)
+    pred = predict_dataframe(artifact, features_df)
+    scored = pd.concat([features_df.reset_index(drop=True), pred.reset_index(drop=True)], axis=1)
+    scored = add_temporal_score(scored).sort_values("ML_FINAL_PROBLEM_SCORE", ascending=False).reset_index(drop=True)
+    if not args.no_sanity_gate:
+        scored = apply_prediction_sanity_gate(scored, args)
+    else:
+        scored["SANITY_GATE_PASS"] = 1
+        scored["SANITY_GATE_REJECT_REASON"] = ""
+    scored.insert(0,"ML_SCORE_RANK",np.arange(1,len(scored)+1))
+    scored.to_csv(out_dir/"cesmlc_v9_inference_scores_all.csv",index=False)
+    scored.head(args.top_n).to_csv(out_dir/f"cesmlc_v9_inference_scores_top{args.top_n}.csv",index=False)
+    mask = abnormal_feature_filter(scored,args) & (safe_numeric(scored.get("SANITY_GATE_PASS", 1), 1).astype(int) == 1)
+    abnormal = scored[mask].copy().sort_values("ML_FINAL_PROBLEM_SCORE", ascending=False).reset_index(drop=True)
+    if abnormal.empty and args.fallback_to_top_problems:
+        fallback = scored[scored["MODEL_PREDICTED_LABEL"].isin(PROBLEM_LABELS)].copy()
+        if not fallback.empty:
+            log("Gate produced zero rows; fallback_to_top_problems enabled, selecting top predicted-problem rows by score.", indent=1)
+            abnormal = fallback.head(int(args.fallback_problem_feature_rows)).copy().reset_index(drop=True)
+    if not abnormal.empty:
+        abnormal = enrich_reference_rca(abnormal,args)
+        abnormal = abnormal.sort_values("ML_FINAL_PROBLEM_SCORE", ascending=False).reset_index(drop=True)
+        abnormal.insert(0,"ABNORMAL_FEATURE_RANK",np.arange(1,len(abnormal)+1))
+    abnormal.to_csv(out_dir/"cesmlc_v9_inference_abnormal_features_all.csv",index=False)
+    abnormal.head(args.top_n).to_csv(out_dir/f"cesmlc_v9_inference_abnormal_features_top{args.top_n}.csv",index=False)
+    ecgi = build_ecgi_summary(abnormal)
+    ecgi.to_csv(out_dir/"cesmlc_v9_inference_abnormal_ecgi_summary_all.csv",index=False)
+    ecgi.head(args.top_n).to_csv(out_dir/f"cesmlc_v9_inference_abnormal_ecgi_summary_top{args.top_n}.csv",index=False)
+    grouped=[]
+    if not ecgi.empty:
+        for cluster,d in ecgi.groupby("PRIMARY_ANOMALY_CLUSTER", sort=False):
+            grouped.append(d.sort_values("ECGI_RANKING_SCORE", ascending=False).head(int(args.per_cluster_top_n)))
+    grouped_top = pd.concat(grouped, ignore_index=True, sort=False).sort_values(["PRIMARY_ANOMALY_CLUSTER","ECGI_RANKING_SCORE"], ascending=[True,False]).head(int(args.report_top_n)) if grouped else pd.DataFrame()
+    grouped_top.to_csv(out_dir/"cesmlc_v9_inference_abnormal_ecgi_summary_grouped_top.csv",index=False)
+    write_jsonl(abnormal, out_dir/"cesmlc_v9_inference_agent_feature_payload.jsonl", int(args.agent_payload_max_rows))
+    write_jsonl(ecgi, out_dir/"cesmlc_v9_inference_agent_ecgi_payload.jsonl", int(args.agent_payload_max_rows))
+    plot_index=create_plots(out_dir, scored, abnormal, ecgi, args)
+    write_report(out_dir, artifact, feature_info, scored, abnormal, ecgi, grouped_top, plot_index, args)
+    summary={"script_version":SCRIPT_VERSION,"artifact_backend":artifact.get("backend"),"scored_feature_rows":len(scored),"abnormal_feature_rows":len(abnormal),"abnormal_ecgis":len(ecgi),"gate_mode":args.gate_mode,"problem_prob_threshold":args.problem_prob_threshold,"final_score_threshold":args.final_score_threshold,"min_model_confidence":args.min_model_confidence,"created_at":time.strftime("%Y-%m-%d %H:%M:%S")}
+    pd.DataFrame([summary]).to_csv(out_dir/"cesmlc_v9_inference_run_summary.csv",index=False)
+    (out_dir/"cesmlc_v9_inference_run_config.json").write_text(json.dumps(vars(args), indent=2, default=str), encoding="utf-8")
+    header("DONE")
+    log(f"Scored feature rows: {len(scored):,}")
+    log(f"Abnormal feature rows after gate: {len(abnormal):,}")
+    log(f"Abnormal ECGIs after gate: {len(ecgi):,}")
+    log(f"Open report: {out_dir/'cesmlc_v9_inference_report.md'}")
+    log(f"Open grouped top: {out_dir/'cesmlc_v9_inference_abnormal_ecgi_summary_grouped_top.csv'}")
+
+
+def parse_args() -> argparse.Namespace:
+    p=argparse.ArgumentParser(description="CESMLC V9 daily inference with post-model RCA/reference enrichment.")
+    src=p.add_mutually_exclusive_group(required=True)
+    src.add_argument("--input", default=None, type=str, help="Raw ENMT/CESMLC CSV input.")
+    src.add_argument("--engineered-features", default=None, type=str, help="Existing engineered feature CSV.")
+    p.add_argument("--model-artifact", required=True, type=str)
+    p.add_argument("--out-dir", required=True, type=str)
+    # Raw feature-engineering pass-through.
+    p.add_argument("--days", default=30, type=int)
+    p.add_argument("--end-date", default=None, type=str)
+    p.add_argument("--server-id", default=None, type=str)
+    p.add_argument("--candidate-mode", default="db_mismatch_only", choices=["db_mismatch_only","all_latest_ecgis","db_mismatch_plus_normal_sample"])
+    p.add_argument("--normal-sample-size", default=0, type=int)
+    p.add_argument("--max-candidate-ecgis", default=0, type=int)
+    p.add_argument("--include-features", default=",".join(DEFAULT_FEATURES), type=str)
+    p.add_argument("--exclude-features", default=None, type=str)
+    p.add_argument("--defaults-json", default=None, type=str)
+    p.add_argument("--enable-db-features", action="store_true")
+    p.add_argument("--reference-source-dir", default=None, type=str)
+    p.add_argument("--atoll-master-4g", default=None, type=str)
+    p.add_argument("--ericsson-5g-master-data", default=None, type=str)
+    p.add_argument("--cssng-data-addition", default=None, type=str)
+    p.add_argument("--atoll-cells5g", default=None, type=str)
+    p.add_argument("--reference-mapping-json", default=None, type=str)
+    p.add_argument("--disable-reference-compatibility", action="store_true")
+    p.add_argument("--reference-numeric-tolerance", default=0.00005, type=float)
+    p.add_argument("--latlon-decimals", default=5, type=int)
+    p.add_argument("--feature-batch-size", default=1, type=int)
+    p.add_argument("--threads", default=1, type=int)
+    p.add_argument("--memory-limit", default="6GB", type=str)
+    p.add_argument("--duckdb-file", default=None, type=str)
+    p.add_argument("--duckdb-temp-dir", default=None, type=str)
+    p.add_argument("--keep-duckdb", action="store_true")
+    p.add_argument("--random-state", default=42, type=int)
+    # Gate/reporting.
+    p.add_argument("--gate-mode", default="balanced", choices=["balanced","strict","review"])
+    p.add_argument("--no-sanity-gate", action="store_true", help="Disable temporal sanity rejection of impossible class predictions.")
+    p.add_argument("--sanity-min-reverses-for-backforth", default=1, type=int)
+    p.add_argument("--sanity-min-aba-for-backforth", default=1, type=int)
+    p.add_argument("--sanity-backforth-min-change-count", default=2, type=int)
+    p.add_argument("--sanity-backforth-min-change-days", default=2, type=int)
+    p.add_argument("--sanity-backforth-max-distinct-values", default=3, type=int)
+    p.add_argument("--sanity-high-frequency-days", default=5, type=int)
+    p.add_argument("--sanity-high-frequency-distinct-values", default=3, type=int)
+    p.add_argument("--sanity-high-frequency-max-mode-share", default=85.0, type=float)
+    p.add_argument("--sanity-default-min-days", default=2, type=int)
+    p.add_argument("--enable-rare-inference-gate", action="store_true", help="Allow RARE_UNCOMMON_CHANGES into report only if strict rare evidence passes. Default off.")
+    p.add_argument("--sanity-rare-min-change-count", default=2, type=int)
+    p.add_argument("--sanity-rare-min-change-days", default=2, type=int)
+    p.add_argument("--sanity-rare-max-change-days", default=3, type=int)
+    p.add_argument("--sanity-rare-max-bulk-change-ratio", default=0.01, type=float)
+    p.add_argument("--sanity-rare-max-multi-field-same-day-count", default=1, type=int)
+    p.add_argument("--sanity-rare-min-abs-delta", default=50.0, type=float)
+    p.add_argument("--problem-prob-threshold", default=0.90, type=float)
+    p.add_argument("--final-score-threshold", default=95.0, type=float)
+    p.add_argument("--min-model-confidence", default=0.70, type=float)
+    p.add_argument("--top-n", default=500, type=int)
+    p.add_argument("--report-top-n", default=100, type=int)
+    p.add_argument("--per-cluster-top-n", default=20, type=int)
+    p.add_argument("--fallback-to-top-problems", action="store_true", default=True)
+    p.add_argument("--no-fallback-to-top-problems", action="store_false", dest="fallback_to_top_problems")
+    p.add_argument("--fallback-problem-feature-rows", default=5000, type=int)
+    p.add_argument("--agent-payload-max-rows", default=100000, type=int)
+    p.add_argument("--no-plots", action="store_true")
+    return p.parse_args()
+
+
+def main() -> int:
+    args=parse_args(); run_inference(args); return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
