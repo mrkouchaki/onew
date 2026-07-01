@@ -1,0 +1,1003 @@
+
+
+
+python v9_1_build_train_dataset.py `
+  --engineered-features "C:\Temp\v81\cesmlc_v8_1_training_data\cesmlc_v8_1_engineered_features_used_for_training.csv" `
+  --out-dir "C:\Temp\v91\training_data_strict"
+
+
+
+#!/usr/bin/env python
+"""
+CESMLC V9 - weak-label training dataset builder
+====================================================
+
+This version keeps the full engineered/audit data, but creates model-ready training
+files that do not use RAN reference fields, RCA fields, rule columns, seed scores,
+or report-only fields as model inputs.
+
+Use either:
+  1) --engineered-features existing_engineered.csv
+  2) --input raw.csv to call the feature-engineering module again
+
+Main outputs:
+  - cesmlc_v9_training_dataset.csv                       full weak-labeled audit table
+  - cesmlc_v9_model_ready_training_dataset.csv            all trainable rows before balancing
+  - cesmlc_v9_balanced_model_ready_training_dataset.csv   recommended training input
+  - cesmlc_v9_model_input_column_policy.csv               which columns are allowed/excluded for model training
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import re
+import sys
+import time
+import warnings
+from pathlib import Path
+from typing import Any, Dict, Iterable, List, Optional, Tuple
+
+import numpy as np
+import pandas as pd
+
+warnings.filterwarnings("ignore")
+
+SCRIPT_VERSION = "9.1.0-training-dataset-strict-seed-sanity"
+RUN_START_TIME = time.time()
+
+NULL_STRINGS = {"", "NULL", "(NULL)", "NAN", "NONE", "NA", "N/A", "<NA>", "-"}
+
+DEFAULT_FEATURES = [
+    "PHYSICALCELLID", "CELLNAME", "CELLTYPE", "ANTENNALAT", "ANTENNALON",
+    "ANTENNAORIENTATION", "ANTENNAOPENING", "ANTENNAHORIZONTALRANGE",
+    "ANTENNABASEALTITUDE", "GEOTYPE", "RADIUS1", "SRVNGAREAAVERAGEALT",
+    "SRVNGAREAAVGALTUNCERT", "SUPPORTEDTECHNOLOGIES",
+]
+
+BUILTIN_FEATURE_RULES: Dict[str, Dict[str, Any]] = {
+    "PHYSICALCELLID": {"default_values": ["0"], "valid_min": 0, "valid_max": 1007, "criticality_weight": 12},
+    "ANTENNALAT": {"valid_min": -90, "valid_max": 90, "criticality_weight": 12, "numeric_tolerance": 0.00005},
+    "ANTENNALON": {"valid_min": -180, "valid_max": 180, "criticality_weight": 12, "numeric_tolerance": 0.00005},
+    "ANTENNAORIENTATION": {"valid_min": 0, "valid_max": 360, "criticality_weight": 10},
+    "ANTENNAOPENING": {"default_values": ["120"], "valid_min": 0, "valid_max": 360, "criticality_weight": 10},
+    "ANTENNAHORIZONTALRANGE": {"default_values": ["7500"], "valid_min": 0, "valid_max": 100000, "criticality_weight": 8},
+    "ANTENNABASEALTITUDE": {"default_values": ["25"], "valid_min": -1000, "valid_max": 10000, "criticality_weight": 7},
+    "RADIUS1": {"valid_min": 1, "valid_max": 100000, "criticality_weight": 8},
+    "SRVNGAREAAVERAGEALT": {"default_values": ["25"], "valid_min": -1000, "valid_max": 10000, "criticality_weight": 6},
+    "SRVNGAREAAVGALTUNCERT": {"valid_min": 0, "valid_max": 10000, "criticality_weight": 4},
+    "CELLNAME": {"criticality_weight": 10},
+    "CELLTYPE": {"criticality_weight": 8},
+    "GEOTYPE": {"criticality_weight": 7},
+    "SUPPORTEDTECHNOLOGIES": {"criticality_weight": 6},
+}
+
+PROBLEM_LABELS = {
+    "HIGH_FREQUENCY_DIFFERENT_VALUES",
+    "REAL_BACK_AND_FORTH_INSTABILITY",
+    "RARE_UNCOMMON_CHANGES",
+    "FLUCTUATING_FALLBACK_TO_DEFAULT",
+    "LONG_TERM_FALLBACK_TO_DEFAULT",
+}
+
+NORMAL_LABELS = {
+    "NORMAL_LOW_INFORMATION",
+    "NORMAL_STABLE_SOURCE",
+    "NORMAL_STABLE_SOURCE_CHANGE",
+    "NORMAL_COORDINATED_MULTI_FIELD_CHANGE",
+    "NORMAL_BULK_OR_REFRESH_PATTERN",
+}
+
+HOLD_LABELS = {"LOW_PRIORITY_SOURCE_HISTORY_SIGNAL"}
+
+# These are not model features. They can remain in full audit/report outputs.
+MODEL_EXCLUDE_PREFIXES = (
+    "REFERENCE_", "DATA_SOURCE_", "RCA_", "RULE_", "SEED_", "EVIDENCE_", "MANUAL_",
+    "IS_", "NORMAL_COHORT", "BALANCE_", "LABEL_SOURCE", "RECOMMENDED_",
+)
+MODEL_EXCLUDE_EXACT = {
+    "ECGI", "ECGI_LABEL", "FEATURE_ROW_ID", "FINAL_TRAINING_LABEL", "TRAIN_FOR_MODEL_FLAG",
+    "TRAINING_WEIGHT", "MODEL_INPUT_READY_FLAG", "FEATURE_EVIDENCE_SCORE", "FEATURE_EVIDENCE_PERCENTILE",
+    "VALUE_DELTA_LATEST_REFERENCE", "REFERENCE_VALUE_NUMERIC", "LATEST_EQUALS_REFERENCE_FLAG",
+    "REFERENCE_VALUE_RAW", "REFERENCE_SOURCE_NAME", "REFERENCE_SOURCE_FILE", "REFERENCE_COLUMN",
+    "REFERENCE_KEY_TYPE", "REFERENCE_KEY_VALUE", "DATA_SOURCE_COMPATIBILITY", "DATA_SOURCE_MATCH_STATUS",
+    "DATA_SOURCE_COMPATIBLE_FLAG", "DATA_SOURCE_MATCH_DELTA", "EVIDENCE_SUMMARY", "RECOMMENDED_ACTION",
+    "FALLBACK_DURATION_CLUSTER", "FALLBACK_SOURCE_DATA_CLUSTER", "FEATURE_ENGINEERING_VERSION",
+    "ANALYSIS_START_DATE", "ANALYSIS_END_DATE", "SOURCE_FIRST_CHANGE_DATE", "SOURCE_LAST_CHANGE_DATE",
+    "FIRST_OBSERVED_DATE", "LAST_OBSERVED_DATE", "LATEST_SOURCE_VALUE_FIRST_SEEN_DATE", "LATEST_SOURCE_VALUE_LAST_SEEN_DATE",
+}
+# DB/source-vs-DB fields are operational/RCA evidence, not pure temporal anomaly behavior.
+DB_MODEL_EXCLUDE_EXACT = {
+    "DB_VALUE_PRESENT_DAYS", "DISTINCT_DB_VALUES_30D", "FIRST_DB_VALUE_RAW", "LATEST_DB_VALUE_RAW",
+    "PREVIOUS_NONLATEST_DB_VALUE_RAW", "LATEST_DB_VALUE_DAYS", "SOURCE_DB_MISMATCH_DAYS",
+    "LATEST_SOURCE_DB_MISMATCH_FLAG", "LATEST_DB_MISMATCH_FLAG", "LATEST_DB_MISMATCH_RAW_ROWS",
+}
+# Identifier/context columns that usually overfit; keep FEATURE, but not specific cell identifiers.
+IDENTIFIER_MODEL_EXCLUDE_EXACT = {
+    "MCC", "MNC", "CID", "USID", "CELLID", "CELL_ID", "NR_CELL_ID", "NRCELLID",
+    "CELLNAME", "CELL_NAME", "PHYSICALCELLID", "PHYSICAL_CELL_ID", "SECTOR_ID", "SECTORID",
+    "ENODEB_ID", "ENB_ID", "GNODEB_ID", "GNB_ID",
+}
+
+
+def elapsed_text() -> str:
+    seconds = int(time.time() - RUN_START_TIME)
+    h, rem = divmod(seconds, 3600)
+    m, s = divmod(rem, 60)
+    return f"{h:02d}:{m:02d}:{s:02d}"
+
+
+def log(message: str, indent: int = 0) -> None:
+    print(f"[{time.strftime('%H:%M:%S')} | +{elapsed_text()}] {'  '*max(0, indent)}{message}", flush=True)
+
+
+def header(title: str) -> None:
+    print("\n" + "=" * 100, flush=True)
+    log(title)
+    print("=" * 100, flush=True)
+
+
+def clean_col_name(c: object) -> str:
+    return str(c).strip().strip('"').upper()
+
+
+def normalize_key_value(x: object) -> str:
+    if pd.isna(x):
+        return ""
+    s = str(x).strip().strip('"')
+    if s.upper() in NULL_STRINGS:
+        return ""
+    s = re.sub(r"\.0$", "", s)
+    s = re.sub(r"\s+", "", s)
+    return s.upper()
+
+
+def normalize_value_text(x: object) -> str:
+    if pd.isna(x):
+        return ""
+    s = str(x).strip().strip('"')
+    if s.upper() in NULL_STRINGS:
+        return ""
+    try:
+        f = float(s)
+        if math.isfinite(f):
+            if abs(f - round(f)) < 1e-12:
+                return str(int(round(f)))
+            return f"{f:.10f}".rstrip("0").rstrip(".").upper()
+    except Exception:
+        pass
+    s = re.sub(r"\s+", "", s)
+    return s.upper()
+
+
+def safe_numeric(series: Any, default: float = 0.0) -> pd.Series:
+    if not isinstance(series, pd.Series):
+        series = pd.Series(series)
+    return pd.to_numeric(series, errors="coerce").replace([np.inf, -np.inf], np.nan).fillna(default)
+
+
+def percentile_rank(series: pd.Series) -> pd.Series:
+    s = safe_numeric(series)
+    if len(s) == 0:
+        return s
+    if s.nunique(dropna=False) <= 1:
+        return pd.Series(np.ones(len(s)) * 50.0, index=s.index)
+    return s.rank(method="average", pct=True) * 100.0
+
+
+def short_value(v: object, max_len: int = 80) -> str:
+    if pd.isna(v):
+        return "<missing>"
+    s = str(v)
+    return s if len(s) <= max_len else s[: max_len - 3] + "..."
+
+
+def excel_safe_ecgi(ecgi: object) -> str:
+    s = normalize_key_value(ecgi)
+    return f"ECGI_{s}" if s else ""
+
+
+def load_feature_rules(defaults_json: Optional[str]) -> Dict[str, Dict[str, Any]]:
+    rules = json.loads(json.dumps(BUILTIN_FEATURE_RULES))
+    if defaults_json:
+        p = Path(defaults_json).expanduser()
+        if not p.exists():
+            raise FileNotFoundError(f"--defaults-json file not found: {p}")
+        extra = json.loads(p.read_text(encoding="utf-8"))
+        for k, v in extra.items():
+            fk = clean_col_name(k)
+            current = rules.get(fk, {})
+            if isinstance(v, dict):
+                current.update(v or {})
+            rules[fk] = current
+    for _, cfg in rules.items():
+        vals = cfg.get("default_values", []) or []
+        cfg["default_values_norm"] = sorted({normalize_value_text(x) for x in vals if normalize_value_text(x)})
+    return rules
+
+
+def value_is_default(feature: str, value: object, rules: Dict[str, Dict[str, Any]]) -> int:
+    f = clean_col_name(feature)
+    v = normalize_value_text(value)
+    defaults = set(rules.get(f, {}).get("default_values_norm", []))
+    return int(bool(v and v in defaults))
+
+
+def value_is_invalid(feature: str, value: object, rules: Dict[str, Dict[str, Any]]) -> int:
+    f = clean_col_name(feature)
+    cfg = rules.get(f, {})
+    if "valid_min" not in cfg and "valid_max" not in cfg:
+        return 0
+    v = normalize_value_text(value)
+    if not v:
+        return 0
+    try:
+        x = float(v)
+    except Exception:
+        return 0
+    if "valid_min" in cfg and x < float(cfg["valid_min"]):
+        return 1
+    if "valid_max" in cfg and x > float(cfg["valid_max"]):
+        return 1
+    return 0
+
+
+def label_confidence_and_weight(label: str) -> Tuple[float, float]:
+    mapping = {
+        "HIGH_FREQUENCY_DIFFERENT_VALUES": (0.88, 1.15),
+        "REAL_BACK_AND_FORTH_INSTABILITY": (0.90, 1.25),
+        "RARE_UNCOMMON_CHANGES": (0.78, 0.95),
+        "FLUCTUATING_FALLBACK_TO_DEFAULT": (0.88, 1.35),
+        "LONG_TERM_FALLBACK_TO_DEFAULT": (0.94, 1.30),
+        "NORMAL_LOW_INFORMATION": (0.70, 0.35),
+        "NORMAL_STABLE_SOURCE": (0.88, 0.70),
+        "NORMAL_STABLE_SOURCE_CHANGE": (0.86, 0.75),
+        "NORMAL_BULK_OR_REFRESH_PATTERN": (0.82, 0.65),
+        "NORMAL_COORDINATED_MULTI_FIELD_CHANGE": (0.80, 0.65),
+        "LOW_PRIORITY_SOURCE_HISTORY_SIGNAL": (0.50, 0.25),
+    }
+    return mapping.get(str(label), (0.50, 0.30))
+
+
+def recommended_action(label: str) -> str:
+    p = str(label or "").upper()
+    if p == "HIGH_FREQUENCY_DIFFERENT_VALUES":
+        return "Investigate repeated multi-day source changes; check unstable upstream feed, repeated imports, or inconsistent joins."
+    if p == "REAL_BACK_AND_FORTH_INSTABILITY":
+        return "Trace repeated reversions/toggles; check competing automation, stale reloads, or overwrites from different source systems."
+    if p == "RARE_UNCOMMON_CHANGES":
+        return "Review isolated uncommon change against planned work, RAN references, and related feature history before action."
+    if p == "FLUCTUATING_FALLBACK_TO_DEFAULT":
+        return "Review short/intermittent fallback to default; compare latest and previous values with source-of-truth and planned activity."
+    if p == "LONG_TERM_FALLBACK_TO_DEFAULT":
+        return "Review sustained or site-wide default fallback; validate feed defaulting, site rebuild/swap/COW, or missing upstream data."
+    if p.startswith("NORMAL"):
+        return "Negative/low-risk training class; keep for model calibration and drift monitoring."
+    return "Manual review recommended."
+
+
+def ensure_numeric_columns(df: pd.DataFrame, cols: Iterable[str]) -> pd.DataFrame:
+    for c in cols:
+        if c not in df.columns:
+            df[c] = 0
+        df[c] = safe_numeric(df[c], 0)
+    return df
+
+
+def add_seed_labels(features_df: pd.DataFrame, args: argparse.Namespace) -> pd.DataFrame:
+    header("V9 TRAINING PHASE - REFERENCE-SAFE WEAK SEED TARGET GENERATION")
+    df = features_df.copy()
+    df.columns = [clean_col_name(c) for c in df.columns]
+    if "ECGI" not in df.columns or "FEATURE" not in df.columns:
+        raise ValueError("Engineered features must contain ECGI and FEATURE columns.")
+    df["ECGI"] = df["ECGI"].map(normalize_key_value)
+    df["FEATURE"] = df["FEATURE"].map(clean_col_name)
+    if "ECGI_LABEL" not in df.columns:
+        df["ECGI_LABEL"] = df["ECGI"].map(excel_safe_ecgi)
+    if "FEATURE_ROW_ID" not in df.columns:
+        df["FEATURE_ROW_ID"] = df["ECGI"].astype(str) + "::" + df["FEATURE"].astype(str)
+
+    rules = load_feature_rules(getattr(args, "defaults_json", None))
+
+    numeric_cols = [
+        "SOURCE_CHANGE_COUNT", "SOURCE_CHANGE_DAYS_COUNT", "DISTINCT_SOURCE_VALUES_30D",
+        "MODE_SOURCE_VALUE_SHARE_PERCENT", "LATEST_SOURCE_VALUE_DAYS", "SOURCE_A_B_A_REVERT_COUNT",
+        "SOURCE_REVERSE_TRANSITION_COUNT", "SOURCE_SAME_DAY_CONFLICT_DAYS", "MAX_SAME_DAY_UNIQUE_SOURCE_VALUES",
+        "LATEST_SOURCE_INVALID_RANGE_FLAG", "LATEST_SOURCE_IS_DEFAULT_FLAG",
+        "PREVIOUS_NONLATEST_SOURCE_IS_DEFAULT_FLAG", "FIRST_SOURCE_IS_DEFAULT_FLAG",
+        "MAX_CANDIDATE_BULK_CHANGE_RATIO", "MAX_MULTI_FIELD_SAME_DAY_CHANGE_COUNT",
+        "DAYS_SINCE_LAST_SOURCE_CHANGE", "LATEST_DAY_SOURCE_CHANGE_EVIDENCE_FLAG",
+        "FEATURE_CRITICALITY_WEIGHT", "VALUE_ENTROPY_30D", "VALUE_MAX_JUMP_30D",
+        "VALUE_LATEST_JUMP", "VALUE_RANGE_30D", "VALUE_STD_30D", "OBSERVED_DAYS_FOR_FEATURE",
+        "RAW_ROWS_FOR_FEATURE", "SOURCE_DB_MISMATCH_DAYS", "LATEST_SOURCE_DB_MISMATCH_FLAG",
+        "LATEST_DB_MISMATCH_FLAG", "LATEST_DB_MISMATCH_RAW_ROWS",
+    ]
+    df = ensure_numeric_columns(df, numeric_cols)
+
+    # Recompute default/invalid flags from source values only; no reference columns are used for labels.
+    for col in ["LATEST_SOURCE_VALUE_RAW", "PREVIOUS_NONLATEST_SOURCE_VALUE_RAW", "FIRST_SOURCE_VALUE_RAW"]:
+        if col not in df.columns:
+            df[col] = ""
+    df["LATEST_SOURCE_IS_DEFAULT_FLAG"] = df.apply(lambda r: value_is_default(r.get("FEATURE", ""), r.get("LATEST_SOURCE_VALUE_RAW", ""), rules), axis=1)
+    df["PREVIOUS_NONLATEST_SOURCE_IS_DEFAULT_FLAG"] = df.apply(lambda r: value_is_default(r.get("FEATURE", ""), r.get("PREVIOUS_NONLATEST_SOURCE_VALUE_RAW", ""), rules), axis=1)
+    df["FIRST_SOURCE_IS_DEFAULT_FLAG"] = df.apply(lambda r: value_is_default(r.get("FEATURE", ""), r.get("FIRST_SOURCE_VALUE_RAW", ""), rules), axis=1)
+    df["LATEST_SOURCE_INVALID_RANGE_FLAG"] = df.apply(lambda r: value_is_invalid(r.get("FEATURE", ""), r.get("LATEST_SOURCE_VALUE_RAW", ""), rules), axis=1)
+    df["FEATURE_CRITICALITY_WEIGHT"] = df.apply(
+        lambda r: float(r.get("FEATURE_CRITICALITY_WEIGHT", 0)) if float(r.get("FEATURE_CRITICALITY_WEIGHT", 0) or 0) > 0 else float(rules.get(clean_col_name(r.get("FEATURE", "")), {}).get("criticality_weight", 5.0)), axis=1
+    )
+
+    latest_source = df["LATEST_SOURCE_VALUE_RAW"].fillna("").astype(str)
+    prev_nonlatest = df["PREVIOUS_NONLATEST_SOURCE_VALUE_RAW"].fillna("").astype(str)
+
+    candidate_date = pd.NaT
+    if "ANALYSIS_END_DATE" in df.columns and len(df):
+        candidate_date = pd.to_datetime(df["ANALYSIS_END_DATE"].dropna().iloc[0], errors="coerce") if df["ANALYSIS_END_DATE"].notna().any() else pd.NaT
+    latest_first = pd.to_datetime(df.get("LATEST_SOURCE_VALUE_FIRST_SEEN_DATE", pd.Series(pd.NaT, index=df.index)), errors="coerce")
+    if pd.notna(candidate_date):
+        latest_days_by_calendar = (candidate_date.normalize() - latest_first.dt.normalize()).dt.days + 1
+    else:
+        latest_days_by_calendar = pd.Series(0, index=df.index)
+    latest_days_by_calendar = latest_days_by_calendar.fillna(0).clip(lower=0)
+    default_duration = np.maximum(df["LATEST_SOURCE_VALUE_DAYS"], latest_days_by_calendar)
+
+    latest_fallback = (
+        (df["LATEST_SOURCE_IS_DEFAULT_FLAG"] == 1)
+        & (prev_nonlatest.astype(str).str.strip() != "")
+        & (df["PREVIOUS_NONLATEST_SOURCE_IS_DEFAULT_FLAG"] == 0)
+        & (df["LATEST_SOURCE_VALUE_DAYS"] >= int(args.default_min_days))
+    )
+    historical_fallback = (
+        (df["LATEST_SOURCE_IS_DEFAULT_FLAG"] == 0)
+        & (df["PREVIOUS_NONLATEST_SOURCE_IS_DEFAULT_FLAG"] == 1)
+        & (df["SOURCE_CHANGE_COUNT"] >= 2)
+    )
+    df["RULE_FALLBACK_TO_DEFAULT_SEED_FLAG"] = (latest_fallback | historical_fallback).astype(int)
+
+    ecgi_stats = df.groupby("ECGI", as_index=False).agg(
+        ECGI_ANALYZED_FEATURE_ROWS=("FEATURE", "size"),
+        ECGI_DEFAULT_FALLBACK_FEATURE_COUNT=("RULE_FALLBACK_TO_DEFAULT_SEED_FLAG", "sum"),
+    )
+    ecgi_stats["ECGI_DEFAULT_FALLBACK_FEATURE_RATIO"] = ecgi_stats["ECGI_DEFAULT_FALLBACK_FEATURE_COUNT"] / np.maximum(ecgi_stats["ECGI_ANALYZED_FEATURE_ROWS"], 1)
+    df = df.drop(columns=["ECGI_DEFAULT_FALLBACK_FEATURE_COUNT", "ECGI_DEFAULT_FALLBACK_FEATURE_RATIO"], errors="ignore")
+    df = df.merge(ecgi_stats[["ECGI", "ECGI_DEFAULT_FALLBACK_FEATURE_COUNT", "ECGI_DEFAULT_FALLBACK_FEATURE_RATIO"]], on="ECGI", how="left")
+    sitewide = (
+        (df["RULE_FALLBACK_TO_DEFAULT_SEED_FLAG"] == 1)
+        & ((df["ECGI_DEFAULT_FALLBACK_FEATURE_COUNT"] >= int(args.sitewide_default_feature_threshold))
+           | (df["ECGI_DEFAULT_FALLBACK_FEATURE_RATIO"] >= float(args.sitewide_default_ratio_threshold)))
+    )
+    long_term = (df["RULE_FALLBACK_TO_DEFAULT_SEED_FLAG"] == 1) & ((default_duration >= int(args.long_term_default_days)) | sitewide)
+    df["RULE_LONG_TERM_FALLBACK_SEED_FLAG"] = long_term.astype(int)
+    df["RULE_FLUCTUATING_FALLBACK_SEED_FLAG"] = ((df["RULE_FALLBACK_TO_DEFAULT_SEED_FLAG"] == 1) & ~long_term).astype(int)
+
+    # Strict V9.1: back-and-forth requires a true reversal/ABA signal.
+    # V8.2/V9.0 had a fallback that classified "many changes among <=3 values" as
+    # REAL_BACK_AND_FORTH even when there was no actual reverse transition. That
+    # caused false labels for simple one-way or step changes.
+    genuine_reverse = (
+        (df["SOURCE_A_B_A_REVERT_COUNT"] >= int(args.min_aba_for_backforth))
+        | (df["SOURCE_REVERSE_TRANSITION_COUNT"] >= int(args.min_reverses_for_backforth))
+    )
+    df["RULE_REAL_BACK_AND_FORTH_SEED_FLAG"] = (
+        genuine_reverse
+        & (df["SOURCE_CHANGE_COUNT"] >= int(args.backforth_min_change_count))
+        & (df["SOURCE_CHANGE_DAYS_COUNT"] >= int(args.backforth_min_change_days))
+        & (df["DISTINCT_SOURCE_VALUES_30D"] <= int(args.backforth_max_distinct_values))
+    ).astype(int)
+    df["RULE_HIGH_FREQUENCY_DIFFERENT_VALUES_SEED_FLAG"] = (
+        (df["SOURCE_CHANGE_DAYS_COUNT"] >= int(args.high_frequency_days))
+        & (df["DISTINCT_SOURCE_VALUES_30D"] >= int(args.high_frequency_distinct_values))
+        & (df["MODE_SOURCE_VALUE_SHARE_PERCENT"] < float(args.high_frequency_max_mode_share))
+    ).astype(int)
+
+    core_problem = (
+        (df["RULE_LONG_TERM_FALLBACK_SEED_FLAG"] == 1)
+        | (df["RULE_FLUCTUATING_FALLBACK_SEED_FLAG"] == 1)
+        | (df["RULE_REAL_BACK_AND_FORTH_SEED_FLAG"] == 1)
+        | (df["RULE_HIGH_FREQUENCY_DIFFERENT_VALUES_SEED_FLAG"] == 1)
+    )
+    # Rare/uncommon uses temporal behavior only. No reference, DATA_SOURCE, or FEATURE_EVIDENCE_* input.
+    temporal_rarity_score = (
+        np.minimum(10.0, safe_numeric(df["SOURCE_CHANGE_COUNT"], 0) * 3.0)
+        + np.minimum(10.0, np.maximum(safe_numeric(df["DISTINCT_SOURCE_VALUES_30D"], 0) - 1, 0) * 4.0)
+        + 10.0 * (safe_numeric(df["LATEST_SOURCE_INVALID_RANGE_FLAG"], 0) > 0).astype(int)
+        + 5.0 * (safe_numeric(df["SOURCE_SAME_DAY_CONFLICT_DAYS"], 0) > 0).astype(int)
+        + np.minimum(8.0, safe_numeric(df["FEATURE_CRITICALITY_WEIGHT"], 5) * 0.5)
+        - np.minimum(10.0, safe_numeric(df["MAX_CANDIDATE_BULK_CHANGE_RATIO"], 0) * 40.0)
+        - np.minimum(8.0, safe_numeric(df["MAX_MULTI_FIELD_SAME_DAY_CHANGE_COUNT"], 0) * 1.5)
+    )
+    df["TEMPORAL_RARITY_SCORE"] = temporal_rarity_score.clip(lower=0)
+    df["TEMPORAL_RARITY_PERCENTILE"] = percentile_rank(df["TEMPORAL_RARITY_SCORE"])
+    # Strict V9.1: do not use a simple one-time change as a weak anomaly label.
+    # One-time recent changes are review candidates, not training targets. Rare/uncommon
+    # remains available only when explicitly enabled and the temporal evidence is strong.
+    material_delta = safe_numeric(df.get("VALUE_DELTA_LATEST_PREVIOUS", 0), 0).abs()
+    rare_evidence = (
+        bool(getattr(args, "enable_rare_seed_labels", False))
+        & (df["SOURCE_CHANGE_COUNT"] >= int(args.rare_min_change_count))
+        & (df["SOURCE_CHANGE_DAYS_COUNT"] >= int(args.rare_min_change_days))
+        & (df["SOURCE_CHANGE_DAYS_COUNT"] <= int(args.rare_max_change_days))
+        & (df["DISTINCT_SOURCE_VALUES_30D"] <= int(args.rare_max_distinct_values))
+        & (df["MAX_CANDIDATE_BULK_CHANGE_RATIO"] <= float(args.rare_max_bulk_change_ratio))
+        & (df["MAX_MULTI_FIELD_SAME_DAY_CHANGE_COUNT"] <= int(args.rare_max_multi_field_same_day_count))
+        & (df["TEMPORAL_RARITY_PERCENTILE"] >= float(args.rare_min_temporal_rarity_percentile))
+        & (
+            (df["LATEST_SOURCE_INVALID_RANGE_FLAG"] == 1)
+            | (df["SOURCE_SAME_DAY_CONFLICT_DAYS"] > 0)
+            | (material_delta >= float(args.rare_min_abs_delta))
+        )
+    )
+    df["RULE_RARE_UNCOMMON_CHANGES_SEED_FLAG"] = ((~core_problem) & rare_evidence).astype(int)
+    df["RULE_ONE_TIME_RECENT_CHANGE_REVIEW_FLAG"] = (
+        (~core_problem)
+        & (df["RULE_RARE_UNCOMMON_CHANGES_SEED_FLAG"] == 0)
+        & (df["SOURCE_CHANGE_COUNT"] == 1)
+        & (df["SOURCE_CHANGE_DAYS_COUNT"] == 1)
+        & (df["DAYS_SINCE_LAST_SOURCE_CHANGE"] <= int(args.one_time_recent_review_days))
+    ).astype(int)
+
+    # Evidence-only flags for QA/RCA, not target labels.
+    df["EVIDENCE_LATEST_DAY_SOURCE_CHANGE_FLAG"] = (df["LATEST_DAY_SOURCE_CHANGE_EVIDENCE_FLAG"] == 1).astype(int)
+    df["EVIDENCE_POSSIBLE_PUSH_NOT_APPLIED_FLAG"] = (
+        (safe_numeric(df.get("SOURCE_DB_MISMATCH_DAYS", 0)) >= int(args.push_mismatch_days))
+        & (safe_numeric(df.get("LATEST_SOURCE_DB_MISMATCH_FLAG", 0)) == 1)
+        & (df["LATEST_SOURCE_VALUE_DAYS"] >= int(args.push_source_stable_days))
+    ).astype(int)
+
+    problem_any = (
+        (df["RULE_LONG_TERM_FALLBACK_SEED_FLAG"] == 1)
+        | (df["RULE_FLUCTUATING_FALLBACK_SEED_FLAG"] == 1)
+        | (df["RULE_REAL_BACK_AND_FORTH_SEED_FLAG"] == 1)
+        | (df["RULE_HIGH_FREQUENCY_DIFFERENT_VALUES_SEED_FLAG"] == 1)
+        | (df["RULE_RARE_UNCOMMON_CHANGES_SEED_FLAG"] == 1)
+    )
+    no_problem = ~problem_any
+    df["RULE_NORMAL_BULK_OR_REFRESH_SEED_FLAG"] = (no_problem & (df["MAX_CANDIDATE_BULK_CHANGE_RATIO"] >= float(args.bulk_change_ratio_threshold))).astype(int)
+    df["RULE_NORMAL_COORDINATED_MULTI_FIELD_SEED_FLAG"] = (
+        no_problem
+        & (df["MAX_MULTI_FIELD_SAME_DAY_CHANGE_COUNT"] >= int(args.coordinated_feature_threshold))
+        & (df["DAYS_SINCE_LAST_SOURCE_CHANGE"] >= int(args.stable_change_suppress_days))
+    ).astype(int)
+    df["RULE_NORMAL_STABLE_SOURCE_CHANGE_SEED_FLAG"] = (
+        no_problem
+        & (df["SOURCE_CHANGE_COUNT"] == 1)
+        & (df["DISTINCT_SOURCE_VALUES_30D"] <= 2)
+        & (df["DAYS_SINCE_LAST_SOURCE_CHANGE"] >= int(args.stable_change_suppress_days))
+    ).astype(int)
+    df["RULE_NORMAL_STABLE_SOURCE_SEED_FLAG"] = (
+        no_problem
+        & (df["SOURCE_CHANGE_COUNT"] == 0)
+        & (df["OBSERVED_DAYS_FOR_FEATURE"] >= int(args.stable_source_min_observed_days))
+        & (latest_source.astype(str).str.strip() != "")
+    ).astype(int)
+    df["RULE_NORMAL_LOW_INFORMATION_SEED_FLAG"] = (no_problem & (df["SOURCE_CHANGE_COUNT"] == 0) & (df["SOURCE_SAME_DAY_CONFLICT_DAYS"] == 0)).astype(int)
+
+    def choose_label(r: pd.Series) -> str:
+        if int(r.get("RULE_HIGH_FREQUENCY_DIFFERENT_VALUES_SEED_FLAG", 0)) == 1:
+            return "HIGH_FREQUENCY_DIFFERENT_VALUES"
+        if int(r.get("RULE_REAL_BACK_AND_FORTH_SEED_FLAG", 0)) == 1:
+            return "REAL_BACK_AND_FORTH_INSTABILITY"
+        if int(r.get("RULE_LONG_TERM_FALLBACK_SEED_FLAG", 0)) == 1:
+            return "LONG_TERM_FALLBACK_TO_DEFAULT"
+        if int(r.get("RULE_FLUCTUATING_FALLBACK_SEED_FLAG", 0)) == 1:
+            return "FLUCTUATING_FALLBACK_TO_DEFAULT"
+        if int(r.get("RULE_RARE_UNCOMMON_CHANGES_SEED_FLAG", 0)) == 1:
+            return "RARE_UNCOMMON_CHANGES"
+        if int(r.get("RULE_ONE_TIME_RECENT_CHANGE_REVIEW_FLAG", 0)) == 1:
+            return "ONE_TIME_RECENT_CHANGE_REVIEW"
+        if int(r.get("RULE_NORMAL_BULK_OR_REFRESH_SEED_FLAG", 0)) == 1:
+            return "NORMAL_BULK_OR_REFRESH_PATTERN"
+        if int(r.get("RULE_NORMAL_COORDINATED_MULTI_FIELD_SEED_FLAG", 0)) == 1:
+            return "NORMAL_COORDINATED_MULTI_FIELD_CHANGE"
+        if int(r.get("RULE_NORMAL_STABLE_SOURCE_CHANGE_SEED_FLAG", 0)) == 1:
+            return "NORMAL_STABLE_SOURCE_CHANGE"
+        if int(r.get("RULE_NORMAL_STABLE_SOURCE_SEED_FLAG", 0)) == 1:
+            return "NORMAL_STABLE_SOURCE"
+        if int(r.get("RULE_NORMAL_LOW_INFORMATION_SEED_FLAG", 0)) == 1:
+            return "NORMAL_LOW_INFORMATION"
+        return "LOW_PRIORITY_SOURCE_HISTORY_SIGNAL"
+
+    df["SEED_LABEL"] = df.apply(choose_label, axis=1)
+    conf_weight = df["SEED_LABEL"].map(label_confidence_and_weight)
+    df["SEED_LABEL_CONFIDENCE"] = [cw[0] for cw in conf_weight]
+    df["TRAINING_WEIGHT"] = [cw[1] for cw in conf_weight]
+    df["IS_PROBLEM_LABEL"] = df["SEED_LABEL"].isin(PROBLEM_LABELS).astype(int)
+    df["IS_NORMAL_LABEL"] = df["SEED_LABEL"].isin(NORMAL_LABELS).astype(int)
+    df["IS_HOLD_LABEL"] = df["SEED_LABEL"].isin(HOLD_LABELS).astype(int)
+
+    score = pd.Series(np.zeros(len(df)), index=df.index, dtype=float)
+    score += 34.0 * df["RULE_HIGH_FREQUENCY_DIFFERENT_VALUES_SEED_FLAG"]
+    score += 32.0 * df["RULE_REAL_BACK_AND_FORTH_SEED_FLAG"]
+    score += 28.0 * df["RULE_RARE_UNCOMMON_CHANGES_SEED_FLAG"]
+    score += 5.0 * df.get("RULE_ONE_TIME_RECENT_CHANGE_REVIEW_FLAG", 0)
+    score += 36.0 * df["RULE_LONG_TERM_FALLBACK_SEED_FLAG"]
+    score += 32.0 * df["RULE_FLUCTUATING_FALLBACK_SEED_FLAG"]
+    score += np.minimum(14.0, 1.4 * df["SOURCE_CHANGE_DAYS_COUNT"])
+    score += np.minimum(10.0, 0.7 * df["SOURCE_CHANGE_COUNT"])
+    score += np.minimum(8.0, 2.0 * np.maximum(df["DISTINCT_SOURCE_VALUES_30D"] - 1, 0))
+    score += 8.0 * df["LATEST_SOURCE_INVALID_RANGE_FLAG"]
+    score += 4.0 * df["EVIDENCE_LATEST_DAY_SOURCE_CHANGE_FLAG"]
+    score += np.where(df["IS_PROBLEM_LABEL"] == 1, safe_numeric(df["FEATURE_CRITICALITY_WEIGHT"], 5), 0.10 * safe_numeric(df["FEATURE_CRITICALITY_WEIGHT"], 5))
+    score -= np.where(df["IS_NORMAL_LABEL"] == 1, 8.0, 0.0)
+    df["SEED_REVIEW_SCORE"] = score.clip(lower=0)
+    df["SEED_REVIEW_PERCENTILE"] = percentile_rank(df["SEED_REVIEW_SCORE"])
+
+    # Normal cohorts for controlled balancing. DB mismatch is only used to choose negative cohorts, not model input.
+    mismatch_signal = (
+        (safe_numeric(df.get("LATEST_DB_MISMATCH_FLAG", 0)) > 0)
+        | (safe_numeric(df.get("LATEST_DB_MISMATCH_RAW_ROWS", 0)) > 0)
+        | (safe_numeric(df.get("LATEST_SOURCE_DB_MISMATCH_FLAG", 0)) > 0)
+        | (safe_numeric(df.get("SOURCE_DB_MISMATCH_DAYS", 0)) > 0)
+    ).astype(int)
+    ecgi_normal = df.assign(__MISMATCH_SIGNAL=mismatch_signal).groupby("ECGI", as_index=False).agg(
+        ECGI_HAS_PROBLEM_LABEL=("IS_PROBLEM_LABEL", "max"),
+        ECGI_ANY_MISMATCH_SIGNAL=("__MISMATCH_SIGNAL", "max"),
+        ECGI_TOTAL_SOURCE_CHANGE_DAYS=("SOURCE_CHANGE_DAYS_COUNT", "sum"),
+        ECGI_MAX_SOURCE_CHANGE_DAYS=("SOURCE_CHANGE_DAYS_COUNT", "max"),
+        ECGI_FEATURE_ROWS=("FEATURE", "size"),
+    )
+    df = df.drop(columns=[c for c in ecgi_normal.columns if c != "ECGI" and c in df.columns], errors="ignore")
+    df = df.merge(ecgi_normal, on="ECGI", how="left")
+    df["NORMAL_COHORT"] = "NOT_NORMAL_OR_MIXED"
+    pure_mask = (df["ECGI_HAS_PROBLEM_LABEL"] == 0) & (df["ECGI_ANY_MISMATCH_SIGNAL"] == 0) & (df["ECGI_TOTAL_SOURCE_CHANGE_DAYS"] == 0)
+    low_risk_mask = (df["ECGI_HAS_PROBLEM_LABEL"] == 0) & (df["ECGI_ANY_MISMATCH_SIGNAL"] > 0) & (df["ECGI_MAX_SOURCE_CHANGE_DAYS"] <= int(args.low_risk_max_change_days))
+    df.loc[pure_mask, "NORMAL_COHORT"] = "PURE_NORMAL_ECGI"
+    df.loc[low_risk_mask, "NORMAL_COHORT"] = "LOW_RISK_MISMATCH_ECGI"
+    df.loc[(df["IS_NORMAL_LABEL"] == 1) & (df["SEED_LABEL"] == "NORMAL_STABLE_SOURCE_CHANGE"), "NORMAL_COHORT"] = "NORMAL_STABLE_SOURCE_CHANGE"
+    df.loc[(df["IS_NORMAL_LABEL"] == 1) & (df["SEED_LABEL"].isin(["NORMAL_COORDINATED_MULTI_FIELD_CHANGE", "NORMAL_BULK_OR_REFRESH_PATTERN"])), "NORMAL_COHORT"] = "NORMAL_COORDINATED_OR_BULK"
+
+    df["TRAIN_FOR_MODEL_FLAG"] = (
+        (df["SEED_LABEL_CONFIDENCE"] >= float(args.min_seed_confidence_for_training))
+        & (df["TRAINING_WEIGHT"] > 0)
+        & (~df["SEED_LABEL"].isin(HOLD_LABELS) | bool(args.include_hold_labels_for_training))
+    ).astype(int)
+    df["FINAL_TRAINING_LABEL"] = df["SEED_LABEL"]
+    df["LABEL_SOURCE_FOR_MODEL"] = "weak_seed_v9_reference_safe"
+    df["MANUAL_LABEL"] = ""
+    df["MANUAL_LABEL_NOTES"] = ""
+    df["RECOMMENDED_ACTION"] = df["SEED_LABEL"].map(recommended_action).fillna("Manual review recommended.")
+    df["EVIDENCE_SUMMARY"] = df.apply(
+        lambda r: (
+            f"{r.get('FEATURE','')} latest={short_value(r.get('LATEST_SOURCE_VALUE_RAW',''))}; "
+            f"previous={short_value(r.get('PREVIOUS_NONLATEST_SOURCE_VALUE_RAW',''))}; "
+            f"change_days={int(r.get('SOURCE_CHANGE_DAYS_COUNT',0))}/{int(r.get('ANALYSIS_DAYS',0) or 0)}; "
+            f"distinct={int(r.get('DISTINCT_SOURCE_VALUES_30D',0))}; cluster={r.get('SEED_LABEL','')}"
+        ), axis=1
+    )
+
+    log(f"Seed-label distribution: {df['SEED_LABEL'].value_counts().to_dict()}", indent=1)
+    log(f"Trainable rows: {int(df['TRAIN_FOR_MODEL_FLAG'].sum()):,} / {len(df):,}", indent=1)
+    return df.sort_values(["IS_PROBLEM_LABEL", "SEED_REVIEW_SCORE"], ascending=[False, False]).reset_index(drop=True)
+
+
+def merge_manual_labels(df: pd.DataFrame, manual_labels_path: Optional[str]) -> pd.DataFrame:
+    if not manual_labels_path:
+        return df
+    p = Path(manual_labels_path).expanduser()
+    if not p.exists():
+        raise FileNotFoundError(f"Manual labels file not found: {p}")
+    manual = pd.read_csv(p, low_memory=False)
+    manual.columns = [clean_col_name(c) for c in manual.columns]
+    needed = {"ECGI", "FEATURE", "MANUAL_LABEL"}
+    if not needed.issubset(set(manual.columns)):
+        raise ValueError(f"Manual label file must contain {needed}")
+    manual = manual[[c for c in ["ECGI", "FEATURE", "MANUAL_LABEL", "MANUAL_LABEL_NOTES"] if c in manual.columns]].copy()
+    manual["ECGI"] = manual["ECGI"].map(normalize_key_value)
+    manual["FEATURE"] = manual["FEATURE"].map(clean_col_name)
+    manual = manual[manual["MANUAL_LABEL"].fillna("").astype(str).str.strip().ne("")]
+    if manual.empty:
+        return df
+    out = df.merge(manual, on=["ECGI", "FEATURE"], how="left", suffixes=("", "_FILE"))
+    mask = out["MANUAL_LABEL_FILE"].fillna("").astype(str).str.strip().ne("") if "MANUAL_LABEL_FILE" in out.columns else pd.Series(False, index=out.index)
+    out.loc[mask, "MANUAL_LABEL"] = out.loc[mask, "MANUAL_LABEL_FILE"].astype(str).str.upper().str.strip()
+    if "MANUAL_LABEL_NOTES_FILE" in out.columns:
+        out.loc[mask, "MANUAL_LABEL_NOTES"] = out.loc[mask, "MANUAL_LABEL_NOTES_FILE"].fillna("")
+    out.loc[mask, "FINAL_TRAINING_LABEL"] = out.loc[mask, "MANUAL_LABEL"]
+    out.loc[mask, "LABEL_SOURCE_FOR_MODEL"] = "manual_label"
+    out.loc[mask, "TRAIN_FOR_MODEL_FLAG"] = 1
+    out.loc[mask, "TRAINING_WEIGHT"] = np.maximum(safe_numeric(out.loc[mask, "TRAINING_WEIGHT"], 1.0), 1.50)
+    out.loc[mask, "SEED_LABEL_CONFIDENCE"] = 1.0
+    out = out.drop(columns=[c for c in ["MANUAL_LABEL_FILE", "MANUAL_LABEL_NOTES_FILE"] if c in out.columns], errors="ignore")
+    log(f"Manual labels merged: {int(mask.sum()):,}", indent=1)
+    return out
+
+
+def sample_rows(d: pd.DataFrame, max_rows: int, random_state: int) -> pd.DataFrame:
+    if d.empty or int(max_rows) <= 0:
+        return d.head(0).copy()
+    if len(d) <= int(max_rows):
+        return d.copy()
+    return d.sample(n=int(max_rows), random_state=int(random_state)).copy()
+
+
+def sample_ecgi_rows(d: pd.DataFrame, max_ecgis: int, max_rows: int, random_state: int) -> pd.DataFrame:
+    if d.empty or int(max_ecgis) <= 0:
+        return d.head(0).copy()
+    ecgis = pd.Series(d["ECGI"].dropna().astype(str).unique())
+    if len(ecgis) > int(max_ecgis):
+        ecgis = ecgis.sample(n=int(max_ecgis), random_state=int(random_state))
+    out = d[d["ECGI"].astype(str).isin(set(ecgis.astype(str)))].copy()
+    if int(max_rows) > 0 and len(out) > int(max_rows):
+        out = out.sample(n=int(max_rows), random_state=int(random_state) + 13).copy()
+    return out
+
+
+def build_balanced_training_dataset(dataset: pd.DataFrame, args: argparse.Namespace) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    header("V9 TRAINING PHASE - BUILD BALANCED MODEL-READY DATASET")
+    if str(args.synthetic_method).lower() != "none":
+        raise ValueError("Synthetic generation is intentionally disabled in V9. Use --synthetic-method none.")
+    df = dataset[safe_numeric(dataset.get("TRAIN_FOR_MODEL_FLAG", 1), 1).astype(int) == 1].copy()
+    if df.empty:
+        raise RuntimeError("No TRAIN_FOR_MODEL_FLAG=1 rows available for balanced dataset.")
+    rs = int(args.balanced_random_state)
+    parts: List[pd.DataFrame] = []
+    rows: List[Dict[str, Any]] = []
+
+    prob = df[df["FINAL_TRAINING_LABEL"].isin(PROBLEM_LABELS)].copy()
+    for i, (label, d) in enumerate(prob.groupby("FINAL_TRAINING_LABEL", sort=True)):
+        cap = int(args.balanced_problem_max_rows_per_class)
+        selected = sample_rows(d, cap, rs + i * 17) if cap > 0 else d.copy()
+        selected["BALANCE_COHORT_SELECTED"] = f"PROBLEM::{label}"
+        parts.append(selected)
+        rows.append({"BALANCE_COHORT": f"PROBLEM::{label}", "AVAILABLE_ROWS": len(d), "SELECTED_ROWS": len(selected), "AVAILABLE_ECGIS": d["ECGI"].nunique(), "SELECTED_ECGIS": selected["ECGI"].nunique()})
+
+    normal = df[df["FINAL_TRAINING_LABEL"].isin(NORMAL_LABELS)].copy()
+    cohort_specs = [
+        ("PURE_NORMAL_ECGI", args.balanced_pure_normal_ecgis, args.balanced_pure_normal_max_rows),
+        ("LOW_RISK_MISMATCH_ECGI", args.balanced_low_risk_ecgis, args.balanced_low_risk_max_rows),
+        ("NORMAL_STABLE_SOURCE_CHANGE", args.balanced_normal_stable_change_ecgis, args.balanced_normal_stable_change_max_rows),
+        ("NORMAL_COORDINATED_OR_BULK", args.balanced_normal_coordinated_or_bulk_ecgis, args.balanced_normal_coordinated_or_bulk_max_rows),
+    ]
+    selected_index = set()
+    for i, (cohort, max_ecgis, max_rows) in enumerate(cohort_specs):
+        d = normal[normal.get("NORMAL_COHORT", "").astype(str) == cohort].copy() if "NORMAL_COHORT" in normal.columns else normal.head(0).copy()
+        selected = sample_ecgi_rows(d, int(max_ecgis), int(max_rows), rs + 100 + i * 17)
+        selected["BALANCE_COHORT_SELECTED"] = cohort
+        parts.append(selected)
+        selected_index.update(selected.index.tolist())
+        rows.append({"BALANCE_COHORT": cohort, "AVAILABLE_ROWS": len(d), "SELECTED_ROWS": len(selected), "AVAILABLE_ECGIS": d["ECGI"].nunique() if not d.empty else 0, "SELECTED_ECGIS": selected["ECGI"].nunique() if not selected.empty else 0})
+
+    low_info = normal[(normal["FINAL_TRAINING_LABEL"] == "NORMAL_LOW_INFORMATION") & (~normal.index.isin(selected_index))].copy()
+    selected = sample_rows(low_info, int(args.balanced_normal_low_info_max_rows), rs + 999)
+    selected["BALANCE_COHORT_SELECTED"] = "NORMAL_LOW_INFORMATION_ROW_SAMPLE"
+    parts.append(selected)
+    rows.append({"BALANCE_COHORT": "NORMAL_LOW_INFORMATION_ROW_SAMPLE", "AVAILABLE_ROWS": len(low_info), "SELECTED_ROWS": len(selected), "AVAILABLE_ECGIS": low_info["ECGI"].nunique() if not low_info.empty else 0, "SELECTED_ECGIS": selected["ECGI"].nunique() if not selected.empty else 0})
+
+    other_norm = normal[(normal["FINAL_TRAINING_LABEL"] != "NORMAL_LOW_INFORMATION") & (~normal.index.isin(selected_index))].copy()
+    selected = sample_rows(other_norm, int(args.balanced_other_normal_max_rows), rs + 1201)
+    selected["BALANCE_COHORT_SELECTED"] = "OTHER_NORMAL_ROW_SAMPLE"
+    parts.append(selected)
+    rows.append({"BALANCE_COHORT": "OTHER_NORMAL_ROW_SAMPLE", "AVAILABLE_ROWS": len(other_norm), "SELECTED_ROWS": len(selected), "AVAILABLE_ECGIS": other_norm["ECGI"].nunique() if not other_norm.empty else 0, "SELECTED_ECGIS": selected["ECGI"].nunique() if not selected.empty else 0})
+
+    balanced = pd.concat([p for p in parts if p is not None and not p.empty], ignore_index=True, sort=False) if parts else df.head(0).copy()
+    if balanced.empty:
+        raise RuntimeError("Balanced dataset is empty. Increase balanced sample caps.")
+    dedupe_cols = ["FEATURE_ROW_ID"] if "FEATURE_ROW_ID" in balanced.columns else ["ECGI", "FEATURE"]
+    balanced = balanced.drop_duplicates(dedupe_cols, keep="first").reset_index(drop=True)
+    balanced["BALANCED_TRAINING_FLAG"] = 1
+    balanced["TRAINING_WEIGHT"] = safe_numeric(balanced.get("TRAINING_WEIGHT", 1.0), 1.0)
+    balanced.loc[balanced["FINAL_TRAINING_LABEL"].isin(PROBLEM_LABELS), "TRAINING_WEIGHT"] *= float(args.problem_weight_multiplier)
+    balanced.loc[balanced["FINAL_TRAINING_LABEL"].isin(NORMAL_LABELS), "TRAINING_WEIGHT"] *= float(args.normal_weight_multiplier)
+
+    report = pd.DataFrame(rows)
+    report = pd.concat([report, pd.DataFrame([{"BALANCE_COHORT": "__TOTAL__", "AVAILABLE_ROWS": len(df), "SELECTED_ROWS": len(balanced), "AVAILABLE_ECGIS": df["ECGI"].nunique(), "SELECTED_ECGIS": balanced["ECGI"].nunique()}])], ignore_index=True)
+    log(f"Balanced rows: {len(balanced):,}; ECGIs: {balanced['ECGI'].nunique():,}", indent=1)
+    log(f"Balanced label distribution: {balanced['FINAL_TRAINING_LABEL'].value_counts().to_dict()}", indent=1)
+    return balanced, report
+
+
+def make_model_input_column_policy(df: pd.DataFrame, args: argparse.Namespace) -> pd.DataFrame:
+    rows = []
+    include_db = bool(getattr(args, "allow_db_fields_for_model", False))
+    include_ids = bool(getattr(args, "allow_identifier_fields_for_model", False))
+    for c in df.columns:
+        reason = "ALLOW"
+        allowed = True
+        if c in MODEL_EXCLUDE_EXACT or any(c.startswith(p) for p in MODEL_EXCLUDE_PREFIXES):
+            allowed = False; reason = "REPORT_RULE_REFERENCE_OR_TARGET_FIELD"
+        if not include_db and c in DB_MODEL_EXCLUDE_EXACT:
+            allowed = False; reason = "DB_OR_SOURCE_VS_DB_RCA_FIELD"
+        if not include_ids and c in IDENTIFIER_MODEL_EXCLUDE_EXACT:
+            allowed = False; reason = "IDENTIFIER_CONTEXT_FIELD"
+        if c.endswith("_CANDIDATE"):
+            allowed = False; reason = "CANDIDATE_METADATA_COPY"
+        rows.append({"COLUMN": c, "MODEL_ALLOWED": int(allowed), "EXCLUSION_REASON": reason})
+    return pd.DataFrame(rows)
+
+
+def build_seed_abnormal_ecgi_summary(dataset: pd.DataFrame) -> pd.DataFrame:
+    problem = dataset[dataset["IS_PROBLEM_LABEL"] == 1].copy()
+    if problem.empty:
+        return pd.DataFrame()
+    problem = problem.sort_values(["ECGI", "SEED_REVIEW_SCORE"], ascending=[True, False])
+    top = problem.groupby("ECGI", as_index=False).head(1).copy().rename(columns={
+        "FEATURE": "PRIMARY_SEED_ABNORMAL_FEATURE",
+        "SEED_LABEL": "PRIMARY_SEED_ANOMALY_CLUSTER",
+        "SEED_REVIEW_SCORE": "PRIMARY_SEED_REVIEW_SCORE",
+        "SEED_LABEL_CONFIDENCE": "PRIMARY_SEED_LABEL_CONFIDENCE",
+    })
+    agg = problem.groupby("ECGI", as_index=False).agg(
+        SEED_ABNORMAL_FEATURE_ROW_COUNT=("FEATURE", "size"),
+        SEED_ABNORMAL_FEATURE_COUNT=("FEATURE", "nunique"),
+        ECGI_SEED_RANKING_SCORE=("SEED_REVIEW_SCORE", "max"),
+        ECGI_AVG_SEED_CONFIDENCE=("SEED_LABEL_CONFIDENCE", "mean"),
+        DISTINCT_SEED_CLUSTERS=("SEED_LABEL", "nunique"),
+        SOURCE_CHANGE_DAYS_COUNT_TOTAL=("SOURCE_CHANGE_DAYS_COUNT", "sum"),
+        SOURCE_CHANGE_COUNT_TOTAL=("SOURCE_CHANGE_COUNT", "sum"),
+    )
+    feat_list = problem.groupby("ECGI").apply(lambda d: ";".join(d.sort_values("SEED_REVIEW_SCORE", ascending=False)["FEATURE"].astype(str).head(30).tolist())).rename("SEED_ABNORMAL_FEATURES").reset_index()
+    detail = problem.groupby("ECGI").apply(lambda d: " | ".join(
+        f"{r.FEATURE}:{r.SEED_LABEL}:score={float(r.SEED_REVIEW_SCORE):.1f}:latest={short_value(getattr(r, 'LATEST_SOURCE_VALUE_RAW', ''), 35)}"
+        for r in d.sort_values("SEED_REVIEW_SCORE", ascending=False).head(8).itertuples()
+    )).rename("TOP_SEED_FEATURE_DETAILS").reset_index()
+    keep_cols = ["ECGI", "ECGI_LABEL", "REGION", "MARKETCLUSTER", "MARKET", "SUBMARKET", "SERVER_ID", "PRIMARY_SEED_ANOMALY_CLUSTER", "PRIMARY_SEED_ABNORMAL_FEATURE", "PRIMARY_SEED_REVIEW_SCORE", "PRIMARY_SEED_LABEL_CONFIDENCE", "LATEST_SOURCE_VALUE_RAW", "PREVIOUS_NONLATEST_SOURCE_VALUE_RAW", "SOURCE_CHANGE_DAYS_COUNT", "SOURCE_CHANGE_COUNT", "DISTINCT_SOURCE_VALUES_30D", "RECOMMENDED_ACTION"]
+    ecgi = agg.merge(top[[c for c in keep_cols if c in top.columns]], on="ECGI", how="left")
+    ecgi = ecgi.merge(feat_list, on="ECGI", how="left").merge(detail, on="ECGI", how="left")
+    ecgi["ECGI_SEED_RANKING_SCORE"] = safe_numeric(ecgi["ECGI_SEED_RANKING_SCORE"], 0) + 5.0 * np.maximum(safe_numeric(ecgi["SEED_ABNORMAL_FEATURE_COUNT"], 0) - 1, 0) + 10.0 * (safe_numeric(ecgi["DISTINCT_SEED_CLUSTERS"], 0) > 1).astype(int)
+    ecgi["ECGI_SEED_PROBLEM_PERCENTILE"] = percentile_rank(ecgi["ECGI_SEED_RANKING_SCORE"])
+    ecgi = ecgi.sort_values("ECGI_SEED_RANKING_SCORE", ascending=False).reset_index(drop=True)
+    ecgi.insert(0, "ECGI_SEED_RANK", np.arange(1, len(ecgi) + 1))
+    return ecgi
+
+
+def create_seed_plots(out_dir: Path, dataset: pd.DataFrame, balanced: Optional[pd.DataFrame], args: argparse.Namespace) -> pd.DataFrame:
+    if args.no_plots:
+        return pd.DataFrame([{"PLOT_FILE": "", "DESCRIPTION": "plots skipped by --no-plots"}])
+    try:
+        import matplotlib.pyplot as plt
+    except Exception as exc:
+        log(f"Plotting unavailable: {exc}", indent=1)
+        return pd.DataFrame([{"PLOT_FILE": "", "DESCRIPTION": f"plotting unavailable: {exc}"}])
+    plots_dir = out_dir / "plots"; plots_dir.mkdir(parents=True, exist_ok=True)
+    rows: List[Dict[str, str]] = []
+    def save(fig, fname: str, desc: str):
+        fp = plots_dir / fname
+        fig.savefig(fp, dpi=160, bbox_inches="tight")
+        plt.close(fig)
+        rows.append({"PLOT_FILE": str(fp), "DESCRIPTION": desc})
+
+    dist = dataset["SEED_LABEL"].value_counts().sort_values(ascending=False)
+    fig, ax = plt.subplots(figsize=(12, 6)); ax.bar(dist.index.astype(str), dist.values); ax.set_yscale("log"); ax.set_title("Full weak seed label distribution - log scale"); ax.set_ylabel("Rows, log scale"); ax.tick_params(axis="x", rotation=45); save(fig, "01_full_seed_label_distribution_log.png", "Full weak seed label distribution on log scale")
+    prob = dataset[dataset["SEED_LABEL"].isin(PROBLEM_LABELS)]
+    if not prob.empty:
+        counts = prob["SEED_LABEL"].value_counts()
+        fig, ax = plt.subplots(figsize=(8, 8)); ax.pie(counts.values, labels=counts.index, autopct="%1.1f%%", startangle=90); ax.set_title("Problem-only weak seed cluster composition"); save(fig, "02_problem_only_seed_cluster_pie.png", "Problem-only weak seed cluster composition")
+        pivot = pd.crosstab(prob["FEATURE"], prob["SEED_LABEL"])
+        pivot = pivot.loc[pivot.sum(axis=1).sort_values(ascending=False).head(30).index]
+        if pivot.size:
+            fig, ax = plt.subplots(figsize=(max(9, 0.8*pivot.shape[1]+6), max(6, 0.35*pivot.shape[0]+3)))
+            im = ax.imshow(pivot.values, aspect="auto"); ax.set_title("Feature x problem seed cluster heatmap"); ax.set_xticks(np.arange(pivot.shape[1])); ax.set_yticks(np.arange(pivot.shape[0])); ax.set_xticklabels(pivot.columns, rotation=45, ha="right", fontsize=8); ax.set_yticklabels(pivot.index, fontsize=8); fig.colorbar(im, ax=ax, label="Rows"); save(fig, "03_feature_by_problem_seed_cluster_heatmap.png", "Feature by problem seed cluster heatmap")
+        labels = counts.index.tolist(); data = [safe_numeric(prob.loc[prob["SEED_LABEL"] == lbl, "SEED_REVIEW_SCORE"], np.nan).dropna().values for lbl in labels]
+        fig, ax = plt.subplots(figsize=(max(9, 0.8*len(labels)+4), 6)); ax.boxplot(data, labels=labels); ax.set_title("Weak seed review score spread by problem cluster"); ax.set_ylabel("SEED_REVIEW_SCORE"); ax.tick_params(axis="x", rotation=45); save(fig, "04_problem_seed_score_boxplot.png", "Weak seed review score spread by problem cluster")
+    if balanced is not None and not balanced.empty:
+        bdist = balanced["FINAL_TRAINING_LABEL"].value_counts().sort_values(ascending=False)
+        fig, ax = plt.subplots(figsize=(12, 6)); ax.bar(bdist.index.astype(str), bdist.values); ax.set_title("Balanced model-ready label distribution"); ax.set_ylabel("Rows"); ax.tick_params(axis="x", rotation=45); save(fig, "05_balanced_model_ready_label_distribution.png", "Balanced model-ready label distribution")
+    plot_index = pd.DataFrame(rows); plot_index.to_csv(out_dir / "cesmlc_v9_seed_plot_index.csv", index=False)
+    return plot_index
+
+
+def write_markdown_report(out_dir: Path, dataset: pd.DataFrame, balanced: Optional[pd.DataFrame], ecgi_summary: pd.DataFrame, balance_report: Optional[pd.DataFrame], plot_index: pd.DataFrame) -> None:
+    lines: List[str] = []
+    lines.append("# CESMLC V9 Weak Seed Training Dataset Report")
+    lines.append("")
+    lines.append(f"Script version: `{SCRIPT_VERSION}`")
+    lines.append("")
+    lines.append("## Dataset summary")
+    lines.append(f"- Full feature rows: **{len(dataset):,}**")
+    lines.append(f"- Unique ECGIs: **{dataset['ECGI'].nunique():,}**")
+    lines.append(f"- Problem feature rows: **{int(dataset['IS_PROBLEM_LABEL'].sum()):,}**")
+    lines.append(f"- Normal feature rows: **{int(dataset['IS_NORMAL_LABEL'].sum()):,}**")
+    if balanced is not None and not balanced.empty:
+        lines.append(f"- Balanced model-ready rows: **{len(balanced):,}**")
+        lines.append(f"- Balanced model-ready ECGIs: **{balanced['ECGI'].nunique():,}**")
+    lines.append("")
+    lines.append("## Production anomaly target clusters")
+    lines.append("V9.1 strict seed sanity: one-time recent changes are HOLD rows, not anomaly targets. RARE_UNCOMMON_CHANGES is generated only when --enable-rare-seed-labels is used.")
+    for label in sorted(PROBLEM_LABELS):
+        lines.append(f"- **{label}**: {int((dataset['SEED_LABEL'] == label).sum()):,}")
+    lines.append("")
+    lines.append("## Normal / negative classes")
+    for label in sorted(NORMAL_LABELS):
+        lines.append(f"- **{label}**: {int((dataset['SEED_LABEL'] == label).sum()):,}")
+    lines.append("")
+    if balanced is not None and not balanced.empty:
+        lines.append("## Balanced model-ready distribution")
+        for label, cnt in balanced["FINAL_TRAINING_LABEL"].value_counts().items():
+            lines.append(f"- **{label}**: {int(cnt):,}")
+        lines.append("")
+    lines.append("## Reference/RCA separation")
+    lines.append("Reference and DATA_SOURCE columns may exist in the full audit dataset, but they are not used for weak-label rules and are marked as model-excluded in `cesmlc_v9_model_input_column_policy.csv`.")
+    lines.append("")
+    if not ecgi_summary.empty:
+        lines.append("## Top weak-labeled abnormal ECGIs")
+        show_cols = ["ECGI_SEED_RANK", "ECGI", "SERVER_ID", "MARKET", "PRIMARY_SEED_ANOMALY_CLUSTER", "PRIMARY_SEED_ABNORMAL_FEATURE", "SEED_ABNORMAL_FEATURES", "ECGI_SEED_RANKING_SCORE", "TOP_SEED_FEATURE_DETAILS"]
+        for _, r in ecgi_summary.head(25).iterrows():
+            lines.append("- " + " | ".join([f"{c}={r.get(c,'')}" for c in show_cols if c in ecgi_summary.columns]))
+        lines.append("")
+    if plot_index is not None and not plot_index.empty:
+        lines.append("## Plots")
+        for _, r in plot_index.head(30).iterrows():
+            lines.append(f"- `{r.get('PLOT_FILE','')}` â {r.get('DESCRIPTION','')}")
+    (out_dir / "cesmlc_v9_training_weak_label_review_report.md").write_text("\n".join(lines), encoding="utf-8")
+
+
+def write_outputs(out_dir: Path, dataset: pd.DataFrame, feature_report: Dict[str, Any], balanced: Optional[pd.DataFrame], balance_report: Optional[pd.DataFrame], args: argparse.Namespace) -> None:
+    header("V9 TRAINING PHASE - WRITE OUTPUTS")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    dataset.to_csv(out_dir / "cesmlc_v9_training_dataset.csv", index=False)
+    model_ready = dataset[dataset["TRAIN_FOR_MODEL_FLAG"] == 1].copy()
+    model_ready.to_csv(out_dir / "cesmlc_v9_model_ready_training_dataset.csv", index=False)
+    policy = make_model_input_column_policy(dataset, args)
+    policy.to_csv(out_dir / "cesmlc_v9_model_input_column_policy.csv", index=False)
+    if balanced is not None and not balanced.empty:
+        balanced.to_csv(out_dir / "cesmlc_v9_balanced_model_ready_training_dataset.csv", index=False)
+    if balance_report is not None and not balance_report.empty:
+        balance_report.to_csv(out_dir / "cesmlc_v9_balanced_sampling_report.csv", index=False)
+    problem_rows = dataset[dataset["IS_PROBLEM_LABEL"] == 1].sort_values("SEED_REVIEW_SCORE", ascending=False)
+    problem_rows.to_csv(out_dir / "cesmlc_v9_seed_problem_rows_all.csv", index=False)
+    problem_rows.head(int(args.top_n_features)).to_csv(out_dir / f"cesmlc_v9_seed_problem_rows_top{int(args.top_n_features)}.csv", index=False)
+    label_summary = dataset.groupby(["SEED_LABEL", "LABEL_SOURCE_FOR_MODEL"], as_index=False).agg(ROW_COUNT=("ECGI", "size"), UNIQUE_ECGI=("ECGI", "nunique"), TRAINABLE_ROWS=("TRAIN_FOR_MODEL_FLAG", "sum"), AVG_CONFIDENCE=("SEED_LABEL_CONFIDENCE", "mean"), AVG_WEIGHT=("TRAINING_WEIGHT", "mean"), AVG_REVIEW_SCORE=("SEED_REVIEW_SCORE", "mean")).sort_values("ROW_COUNT", ascending=False)
+    label_summary.to_csv(out_dir / "cesmlc_v9_seed_label_summary.csv", index=False)
+    ecgi_summary = build_seed_abnormal_ecgi_summary(dataset)
+    ecgi_summary.to_csv(out_dir / "cesmlc_v9_seed_anomaly_ecgi_summary_all.csv", index=False)
+    ecgi_summary.head(500).to_csv(out_dir / "cesmlc_v9_seed_anomaly_ecgi_summary_top500.csv", index=False)
+    review_cols = ["ECGI", "ECGI_LABEL", "FEATURE", "SEED_LABEL", "FINAL_TRAINING_LABEL", "SEED_LABEL_CONFIDENCE", "SEED_REVIEW_SCORE", "SERVER_ID", "MARKET", "NORMAL_COHORT", "LATEST_SOURCE_VALUE_RAW", "PREVIOUS_NONLATEST_SOURCE_VALUE_RAW", "SOURCE_CHANGE_DAYS_COUNT", "SOURCE_CHANGE_COUNT", "DISTINCT_SOURCE_VALUES_30D", "EVIDENCE_SUMMARY", "RECOMMENDED_ACTION", "MANUAL_LABEL", "MANUAL_LABEL_NOTES"]
+    review_source = pd.concat([problem_rows.head(1000), dataset[dataset["IS_NORMAL_LABEL"] == 1].sample(n=min(1000, int(dataset["IS_NORMAL_LABEL"].sum())), random_state=int(args.balanced_random_state)) if int(dataset["IS_NORMAL_LABEL"].sum()) > 0 else dataset.head(0)], ignore_index=True, sort=False)
+    review_source[[c for c in review_cols if c in review_source.columns]].to_csv(out_dir / "cesmlc_v9_manual_review_label_template.csv", index=False)
+    pd.DataFrame([feature_report]).to_csv(out_dir / "cesmlc_v9_training_dataset_processing_report.csv", index=False)
+    plot_index = create_seed_plots(out_dir, dataset, balanced, args)
+    write_markdown_report(out_dir, dataset, balanced, ecgi_summary, balance_report, plot_index)
+    (out_dir / "00_READ_ME_V8_2_TRAINING_DATASET.md").write_text(
+        f"# CESMLC V9 training dataset\n\nRecommended training input: `cesmlc_v9_balanced_model_ready_training_dataset.csv`\n\nFull audit dataset: `cesmlc_v9_training_dataset.csv`\n\nModel feature policy: `cesmlc_v9_model_input_column_policy.csv`\n\nRows: {len(dataset):,}\nBalanced rows: {0 if balanced is None else len(balanced):,}\nScript version: {SCRIPT_VERSION}\n",
+        encoding="utf-8",
+    )
+    log(f"Training dataset rows: {len(dataset):,}", indent=1)
+    log(f"Model-ready rows before balancing: {len(model_ready):,}", indent=1)
+    if balanced is not None:
+        log(f"Balanced model-ready rows: {len(balanced):,}", indent=1)
+    log(f"Output: {out_dir}", indent=1)
+
+
+def build_or_load_features(args: argparse.Namespace, out_dir: Path) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+    if args.engineered_features:
+        p = Path(args.engineered_features).expanduser()
+        if not p.exists():
+            raise FileNotFoundError(f"Engineered features file not found: {p}")
+        log(f"Loading existing engineered features: {p}")
+        df = pd.read_csv(p, low_memory=False)
+        df.columns = [clean_col_name(c) for c in df.columns]
+        return df, {"engineered_features_input": str(p), "engineered_feature_rows": int(len(df))}
+    if not args.input:
+        raise ValueError("Either --input or --engineered-features is required.")
+    script_dir = Path(__file__).resolve().parent
+    if str(script_dir) not in sys.path:
+        sys.path.insert(0, str(script_dir))
+    module_names = ["v9_feature_engineering", "v82_feature_engineering", "v821_feature_engineering", "v821_fixed_feature_engineering", "v81_feature_engineering"]
+    last_exc: Optional[Exception] = None
+    for mod_name in module_names:
+        try:
+            mod = __import__(mod_name, fromlist=["build_feature_table"])
+            log(f"Raw input mode selected: using {mod_name}.build_feature_table(...)", indent=1)
+            features_df, feature_report = mod.build_feature_table(Path(args.input).expanduser(), out_dir / "feature_engineering", args)
+            features_df.to_csv(out_dir / "cesmlc_v9_engineered_features_used_for_training.csv", index=False)
+            return features_df, feature_report
+        except Exception as exc:
+            last_exc = exc
+            continue
+    raise RuntimeError("Raw input mode requires v9_feature_engineering.py or a compatible V8/V8.2 feature-engineering file in the same folder.") from last_exc
+
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="CESMLC V9 reference-safe training dataset builder.")
+    src = p.add_mutually_exclusive_group(required=True)
+    src.add_argument("--input", default=None, type=str, help="Raw ENMT/CESMLC CSV input.")
+    src.add_argument("--engineered-features", default=None, type=str, help="Existing engineered feature CSV.")
+    p.add_argument("--out-dir", required=True, type=str)
+    p.add_argument("--manual-labels", default=None, type=str)
+
+    # Pass-through raw feature engineering args.
+    p.add_argument("--days", default=30, type=int)
+    p.add_argument("--end-date", default=None, type=str)
+    p.add_argument("--server-id", default=None, type=str)
+    p.add_argument("--candidate-mode", default="db_mismatch_plus_normal_sample", choices=["db_mismatch_only", "all_latest_ecgis", "db_mismatch_plus_normal_sample"])
+    p.add_argument("--normal-sample-size", default=50000, type=int)
+    p.add_argument("--max-candidate-ecgis", default=0, type=int)
+    p.add_argument("--include-features", default=",".join(DEFAULT_FEATURES), type=str)
+    p.add_argument("--exclude-features", default=None, type=str)
+    p.add_argument("--defaults-json", default=None, type=str)
+    p.add_argument("--enable-db-features", action="store_true")
+    p.add_argument("--reference-source-dir", default=None, type=str)
+    p.add_argument("--atoll-master-4g", default=None, type=str)
+    p.add_argument("--ericsson-5g-master-data", default=None, type=str)
+    p.add_argument("--cssng-data-addition", default=None, type=str)
+    p.add_argument("--atoll-cells5g", default=None, type=str)
+    p.add_argument("--reference-mapping-json", default=None, type=str)
+    p.add_argument("--disable-reference-compatibility", action="store_true")
+    p.add_argument("--reference-numeric-tolerance", default=0.00005, type=float)
+    p.add_argument("--latlon-decimals", default=5, type=int)
+    p.add_argument("--feature-batch-size", default=1, type=int)
+    p.add_argument("--threads", default=1, type=int)
+    p.add_argument("--memory-limit", default="6GB", type=str)
+    p.add_argument("--duckdb-file", default=None, type=str)
+    p.add_argument("--duckdb-temp-dir", default=None, type=str)
+    p.add_argument("--keep-duckdb", action="store_true")
+    p.add_argument("--random-state", default=42, type=int)
+
+    # Seed thresholds.
+    p.add_argument("--high-frequency-days", default=5, type=int)
+    p.add_argument("--high-frequency-distinct-values", default=3, type=int)
+    p.add_argument("--high-frequency-max-mode-share", default=85.0, type=float)
+    p.add_argument("--min-reverses-for-backforth", default=1, type=int)
+    p.add_argument("--min-aba-for-backforth", default=1, type=int)
+    p.add_argument("--backforth-min-change-count", default=2, type=int)
+    p.add_argument("--backforth-min-change-days", default=2, type=int)
+    p.add_argument("--backforth-max-distinct-values", default=3, type=int)
+    p.add_argument("--default-min-days", default=2, type=int)
+    p.add_argument("--long-term-default-days", default=7, type=int)
+    p.add_argument("--sitewide-default-feature-threshold", default=4, type=int)
+    p.add_argument("--sitewide-default-ratio-threshold", default=0.50, type=float)
+    p.add_argument("--rare-min-change-count", default=2, type=int)
+    p.add_argument("--rare-min-change-days", default=2, type=int)
+    p.add_argument("--rare-max-change-days", default=3, type=int)
+    p.add_argument("--rare-max-distinct-values", default=3, type=int)
+    p.add_argument("--rare-max-bulk-change-ratio", default=0.02, type=float)
+    p.add_argument("--rare-max-multi-field-same-day-count", default=2, type=int)
+    p.add_argument("--rare-recent-days", default=7, type=int)
+    p.add_argument("--rare-min-temporal-rarity-percentile", default=99.0, type=float)
+    p.add_argument("--rare-min-abs-delta", default=50.0, type=float, help="Minimum absolute latest-vs-previous delta for weak rare labels when --enable-rare-seed-labels is used.")
+    p.add_argument("--enable-rare-seed-labels", action="store_true", help="Enable weak RARE_UNCOMMON_CHANGES labels. Default is off because one-time changes need manual/RCA confirmation.")
+    p.add_argument("--one-time-recent-review-days", default=7, type=int, help="Recent one-time changes become HOLD/QA rows, not model targets.")
+    p.add_argument("--stable-change-suppress-days", default=5, type=int)
+    p.add_argument("--bulk-change-ratio-threshold", default=0.25, type=float)
+    p.add_argument("--coordinated-feature-threshold", default=4, type=int)
+    p.add_argument("--stable-source-min-observed-days", default=20, type=int)
+    p.add_argument("--low-risk-max-change-days", default=1, type=int)
+    p.add_argument("--push-source-stable-days", default=2, type=int)
+    p.add_argument("--push-mismatch-days", default=2, type=int)
+    p.add_argument("--min-seed-confidence-for-training", default=0.50, type=float)
+    p.add_argument("--include-hold-labels-for-training", action="store_true")
+
+    # Balanced dataset options.
+    p.add_argument("--write-balanced-training-dataset", action="store_true", default=True)
+    p.add_argument("--no-balanced-training-dataset", action="store_false", dest="write_balanced_training_dataset")
+    p.add_argument("--balanced-random-state", default=42, type=int)
+    p.add_argument("--balanced-problem-max-rows-per-class", default=0, type=int, help="0 means keep all problem rows.")
+    p.add_argument("--balanced-pure-normal-ecgis", default=5000, type=int)
+    p.add_argument("--balanced-pure-normal-max-rows", default=80000, type=int)
+    p.add_argument("--balanced-low-risk-ecgis", default=5000, type=int)
+    p.add_argument("--balanced-low-risk-max-rows", default=80000, type=int)
+    p.add_argument("--balanced-normal-stable-change-ecgis", default=2500, type=int)
+    p.add_argument("--balanced-normal-stable-change-max-rows", default=30000, type=int)
+    p.add_argument("--balanced-normal-coordinated-or-bulk-ecgis", default=2500, type=int)
+    p.add_argument("--balanced-normal-coordinated-or-bulk-max-rows", default=30000, type=int)
+    p.add_argument("--balanced-normal-low-info-max-rows", default=50000, type=int)
+    p.add_argument("--balanced-other-normal-max-rows", default=30000, type=int)
+    p.add_argument("--problem-weight-multiplier", default=1.20, type=float)
+    p.add_argument("--normal-weight-multiplier", default=0.85, type=float)
+    p.add_argument("--synthetic-method", default="none", choices=["none"])
+    p.add_argument("--allow-db-fields-for-model", action="store_true")
+    p.add_argument("--allow-identifier-fields-for-model", action="store_true")
+    p.add_argument("--top-n-features", default=2000, type=int)
+    p.add_argument("--no-plots", action="store_true")
+    return p.parse_args()
+
+
+def main() -> int:
+    args = parse_args()
+    out_dir = Path(args.out_dir).expanduser(); out_dir.mkdir(parents=True, exist_ok=True)
+    header("CESMLC V9 TRAINING DATASET BUILDER")
+    features_df, feature_report = build_or_load_features(args, out_dir)
+    dataset = add_seed_labels(features_df, args)
+    dataset = merge_manual_labels(dataset, args.manual_labels)
+    balanced, balance_report = (None, None)
+    if args.write_balanced_training_dataset:
+        balanced, balance_report = build_balanced_training_dataset(dataset, args)
+    write_outputs(out_dir, dataset, feature_report, balanced, balance_report, args)
+    header("DONE")
+    log(f"Total runtime: {elapsed_text()}")
+    log(f"Open first: {out_dir / 'cesmlc_v9_training_weak_label_review_report.md'}")
+    log(f"Train using: {out_dir / 'cesmlc_v9_balanced_model_ready_training_dataset.csv'}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
