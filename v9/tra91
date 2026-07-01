@@ -1,0 +1,576 @@
+
+
+
+python v9_1_train_model.py `
+  --dataset "C:\Temp\v91\training_data_strict\cesmlc_v9_balanced_model_ready_training_dataset.csv" `
+  --out-dir "C:\Temp\v91\model_outputs" `
+  --model catboost `
+  --iterations 250 `
+  --early-stopping-rounds 30 `
+  --threads 1 `
+  --train-verbose 25
+
+
+#!/usr/bin/env python
+"""
+CESMLC V9 - reference-safe problem-state model trainer
+======================================================
+
+Recommended input:
+  cesmlc_v9_balanced_model_ready_training_dataset.csv
+or:
+  cesmlc_v8_2_balanced_model_ready_training_dataset.csv
+
+Key fixes:
+* Excludes REFERENCE_/DATA_SOURCE_/RCA fields from model features.
+* Excludes FEATURE_EVIDENCE_SCORE / FEATURE_EVIDENCE_PERCENTILE and all seed/rule/report fields.
+* Saves each backend under its own output folder: <out-dir>/<backend>/...
+* Produces per-class quality reports and problem-only plots.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import pickle
+import re
+import time
+import warnings
+from pathlib import Path
+from typing import Any, Dict, Iterable, List, Optional, Tuple
+
+import numpy as np
+import pandas as pd
+
+warnings.filterwarnings("ignore")
+
+SCRIPT_VERSION = "9.0.0-production-trainer-reference-safe-model-folders"
+RUN_START_TIME = time.time()
+
+PROBLEM_LABELS = {
+    "HIGH_FREQUENCY_DIFFERENT_VALUES",
+    "REAL_BACK_AND_FORTH_INSTABILITY",
+    "RARE_UNCOMMON_CHANGES",
+    "FLUCTUATING_FALLBACK_TO_DEFAULT",
+    "LONG_TERM_FALLBACK_TO_DEFAULT",
+}
+NORMAL_LABELS = {
+    "NORMAL_LOW_INFORMATION",
+    "NORMAL_STABLE_SOURCE",
+    "NORMAL_STABLE_SOURCE_CHANGE",
+    "NORMAL_COORDINATED_MULTI_FIELD_CHANGE",
+    "NORMAL_BULK_OR_REFRESH_PATTERN",
+}
+
+MODEL_EXCLUDE_PREFIXES = (
+    "REFERENCE_", "DATA_SOURCE_", "RCA_", "RULE_", "SEED_", "EVIDENCE_", "MANUAL_",
+    "IS_", "NORMAL_COHORT", "BALANCE_", "LABEL_SOURCE", "RECOMMENDED_",
+)
+MODEL_EXCLUDE_EXACT = {
+    "ECGI", "ECGI_LABEL", "FEATURE_ROW_ID", "FINAL_TRAINING_LABEL", "TRAIN_FOR_MODEL_FLAG",
+    "TRAINING_WEIGHT", "MODEL_INPUT_READY_FLAG", "FEATURE_EVIDENCE_SCORE", "FEATURE_EVIDENCE_PERCENTILE",
+    "TEMPORAL_RARITY_SCORE", "TEMPORAL_RARITY_PERCENTILE",
+    "VALUE_DELTA_LATEST_REFERENCE", "REFERENCE_VALUE_NUMERIC", "LATEST_EQUALS_REFERENCE_FLAG",
+    "REFERENCE_VALUE_RAW", "REFERENCE_SOURCE_NAME", "REFERENCE_SOURCE_FILE", "REFERENCE_COLUMN",
+    "REFERENCE_KEY_TYPE", "REFERENCE_KEY_VALUE", "DATA_SOURCE_COMPATIBILITY", "DATA_SOURCE_MATCH_STATUS",
+    "DATA_SOURCE_COMPATIBLE_FLAG", "DATA_SOURCE_MATCH_DELTA", "EVIDENCE_SUMMARY", "RECOMMENDED_ACTION",
+    "FALLBACK_DURATION_CLUSTER", "FALLBACK_SOURCE_DATA_CLUSTER", "FEATURE_ENGINEERING_VERSION",
+    "ANALYSIS_START_DATE", "ANALYSIS_END_DATE", "SOURCE_FIRST_CHANGE_DATE", "SOURCE_LAST_CHANGE_DATE",
+    "FIRST_OBSERVED_DATE", "LAST_OBSERVED_DATE", "LATEST_SOURCE_VALUE_FIRST_SEEN_DATE", "LATEST_SOURCE_VALUE_LAST_SEEN_DATE",
+}
+DB_MODEL_EXCLUDE_EXACT = {
+    "DB_VALUE_PRESENT_DAYS", "DISTINCT_DB_VALUES_30D", "FIRST_DB_VALUE_RAW", "LATEST_DB_VALUE_RAW",
+    "PREVIOUS_NONLATEST_DB_VALUE_RAW", "LATEST_DB_VALUE_DAYS", "SOURCE_DB_MISMATCH_DAYS",
+    "LATEST_SOURCE_DB_MISMATCH_FLAG", "LATEST_DB_MISMATCH_FLAG", "LATEST_DB_MISMATCH_RAW_ROWS",
+}
+IDENTIFIER_MODEL_EXCLUDE_EXACT = {
+    "MCC", "MNC", "CID", "USID", "CELLID", "CELL_ID", "NR_CELL_ID", "NRCELLID",
+    "CELLNAME", "CELL_NAME", "PHYSICALCELLID", "PHYSICAL_CELL_ID", "SECTOR_ID", "SECTORID",
+    "ENODEB_ID", "ENB_ID", "GNODEB_ID", "GNB_ID",
+}
+
+
+def elapsed_text() -> str:
+    seconds = int(time.time() - RUN_START_TIME)
+    h, rem = divmod(seconds, 3600)
+    m, s = divmod(rem, 60)
+    return f"{h:02d}:{m:02d}:{s:02d}"
+
+
+def log(message: str, indent: int = 0) -> None:
+    print(f"[{time.strftime('%H:%M:%S')} | +{elapsed_text()}] {'  '*max(0, indent)}{message}", flush=True)
+
+
+def header(title: str) -> None:
+    print("\n" + "=" * 100, flush=True)
+    log(title)
+    print("=" * 100, flush=True)
+
+
+def clean_col_name(c: object) -> str:
+    return str(c).strip().strip('"').upper()
+
+
+def safe_numeric(series: Any, default: float = 0.0) -> pd.Series:
+    if not isinstance(series, pd.Series):
+        series = pd.Series(series)
+    return pd.to_numeric(series, errors="coerce").replace([np.inf, -np.inf], np.nan).fillna(default)
+
+
+def choose_backend(requested: str) -> str:
+    requested = str(requested).lower().strip()
+    if requested != "auto":
+        return requested
+    try:
+        import catboost  # noqa: F401
+        return "catboost"
+    except Exception:
+        pass
+    try:
+        import lightgbm  # noqa: F401
+        return "lightgbm"
+    except Exception:
+        pass
+    return "histgb"
+
+
+def load_dataset(path: Path, args: argparse.Namespace) -> pd.DataFrame:
+    header("STEP 1 - LOAD TRAINING DATASET")
+    if not path.exists():
+        raise FileNotFoundError(f"Dataset not found: {path}")
+    df = pd.read_csv(path, low_memory=False)
+    df.columns = [clean_col_name(c) for c in df.columns]
+    label_col = clean_col_name(args.label_col)
+    if label_col not in df.columns:
+        raise ValueError(f"Label column {label_col} not found in dataset. Columns include: {list(df.columns)[:30]}")
+    if "TRAIN_FOR_MODEL_FLAG" in df.columns:
+        df = df[safe_numeric(df["TRAIN_FOR_MODEL_FLAG"], 1).astype(int) == 1].copy()
+    df[label_col] = df[label_col].astype(str).str.upper().str.strip()
+    counts = df[label_col].value_counts()
+    keep_labels = counts[counts >= int(args.min_class_count)].index.tolist()
+    dropped = sorted(set(counts.index) - set(keep_labels))
+    if dropped:
+        log(f"Dropping labels below min_class_count={args.min_class_count}: {dropped}", indent=1)
+    df = df[df[label_col].isin(keep_labels)].copy()
+    if df.empty or df[label_col].nunique() < 2:
+        raise RuntimeError("Training data has fewer than 2 labels after filtering.")
+    log(f"Dataset rows loaded for model: {len(df):,}", indent=1)
+    log(f"Training labels: {df[label_col].value_counts().to_dict()}", indent=1)
+    return df.reset_index(drop=True)
+
+
+def read_policy(dataset_path: Path, args: argparse.Namespace) -> Optional[pd.DataFrame]:
+    if args.feature_policy:
+        p = Path(args.feature_policy).expanduser()
+    else:
+        p = dataset_path.parent / "cesmlc_v9_model_input_column_policy.csv"
+        if not p.exists():
+            p = dataset_path.parent / "cesmlc_v8_2_model_input_column_policy.csv"
+    if p.exists():
+        pol = pd.read_csv(p, low_memory=False)
+        pol.columns = [clean_col_name(c) for c in pol.columns]
+        if {"COLUMN", "MODEL_ALLOWED"}.issubset(pol.columns):
+            pol["COLUMN"] = pol["COLUMN"].map(clean_col_name)
+            return pol
+    return None
+
+
+def infer_feature_columns(df: pd.DataFrame, dataset_path: Path, args: argparse.Namespace) -> Tuple[List[str], pd.DataFrame]:
+    label_col = clean_col_name(args.label_col)
+    policy = read_policy(dataset_path, args)
+    rows = []
+    include_db = bool(args.allow_db_fields_for_model)
+    include_ids = bool(args.allow_identifier_fields_for_model)
+    explicit_allowed = set()
+    if policy is not None:
+        explicit_allowed = set(policy.loc[safe_numeric(policy["MODEL_ALLOWED"], 0).astype(int) == 1, "COLUMN"].astype(str))
+    for c in df.columns:
+        reason = "ALLOW"
+        allowed = True
+        if c == label_col:
+            allowed = False; reason = "TARGET_LABEL"
+        elif policy is not None:
+            allowed = c in explicit_allowed
+            reason = "POLICY_ALLOW" if allowed else "POLICY_EXCLUDE"
+        else:
+            if c in MODEL_EXCLUDE_EXACT or any(c.startswith(p) for p in MODEL_EXCLUDE_PREFIXES):
+                allowed = False; reason = "REPORT_RULE_REFERENCE_OR_TARGET_FIELD"
+            if not include_db and c in DB_MODEL_EXCLUDE_EXACT:
+                allowed = False; reason = "DB_OR_SOURCE_VS_DB_RCA_FIELD"
+            if not include_ids and c in IDENTIFIER_MODEL_EXCLUDE_EXACT:
+                allowed = False; reason = "IDENTIFIER_CONTEXT_FIELD"
+            if c.endswith("_CANDIDATE"):
+                allowed = False; reason = "CANDIDATE_METADATA_COPY"
+        rows.append({"COLUMN": c, "MODEL_ALLOWED": int(allowed), "EXCLUSION_REASON": reason})
+    pol_out = pd.DataFrame(rows)
+    features = pol_out.loc[pol_out["MODEL_ALLOWED"] == 1, "COLUMN"].tolist()
+    if args.exclude_columns:
+        excludes = {clean_col_name(x) for x in args.exclude_columns.split(",") if x.strip()}
+        features = [c for c in features if c not in excludes]
+        pol_out.loc[pol_out["COLUMN"].isin(excludes), ["MODEL_ALLOWED", "EXCLUSION_REASON"]] = [0, "USER_EXCLUDED"]
+    if args.include_only_columns:
+        includes = {clean_col_name(x) for x in args.include_only_columns.split(",") if x.strip()}
+        features = [c for c in features if c in includes]
+        pol_out.loc[~pol_out["COLUMN"].isin(includes), ["MODEL_ALLOWED", "EXCLUSION_REASON"]] = [0, "NOT_IN_USER_INCLUDE_ONLY"]
+    if not features:
+        raise RuntimeError("No model features selected after exclusions.")
+    return features, pol_out
+
+
+def split_grouped(df: pd.DataFrame, label_col: str, args: argparse.Namespace) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    rng = np.random.default_rng(int(args.random_state))
+    if args.split_mode == "row" or "ECGI" not in df.columns:
+        idx = np.arange(len(df)); rng.shuffle(idx)
+        n_test = int(round(len(idx) * float(args.test_size)))
+        n_valid = int(round((len(idx) - n_test) * float(args.eval_size)))
+        test_idx = idx[:n_test]; valid_idx = idx[n_test:n_test+n_valid]; train_idx = idx[n_test+n_valid:]
+        return df.iloc[train_idx].copy(), df.iloc[valid_idx].copy(), df.iloc[test_idx].copy()
+    groups = pd.Series(df["ECGI"].astype(str).unique())
+    groups = groups.sample(frac=1.0, random_state=int(args.random_state)).reset_index(drop=True)
+    n_test = int(round(len(groups) * float(args.test_size)))
+    n_valid = int(round((len(groups) - n_test) * float(args.eval_size)))
+    test_g = set(groups.iloc[:n_test])
+    valid_g = set(groups.iloc[n_test:n_test+n_valid])
+    train_g = set(groups.iloc[n_test+n_valid:])
+    train = df[df["ECGI"].astype(str).isin(train_g)].copy()
+    valid = df[df["ECGI"].astype(str).isin(valid_g)].copy()
+    test = df[df["ECGI"].astype(str).isin(test_g)].copy()
+    # Ensure every class appears in train; if not, move a few rows from valid/test to train.
+    all_labels = set(df[label_col].unique())
+    missing = all_labels - set(train[label_col].unique())
+    if missing:
+        movers = df[df[label_col].isin(missing)].groupby(label_col, group_keys=False).head(max(1, int(args.min_class_count))).copy()
+        train = pd.concat([train, movers], ignore_index=True).drop_duplicates().reset_index(drop=True)
+        valid = valid.drop(index=valid.index.intersection(movers.index), errors="ignore")
+        test = test.drop(index=test.index.intersection(movers.index), errors="ignore")
+        log(f"Moved rare-label rows into train split for labels: {sorted(missing)}", indent=1)
+    return train, valid, test
+
+
+def prepare_X(df: pd.DataFrame, features: List[str], categorical_features: List[str]) -> pd.DataFrame:
+    X = df[features].copy()
+    for c in categorical_features:
+        if c in X.columns:
+            X[c] = X[c].fillna("__MISSING__").astype(str)
+    for c in features:
+        if c not in categorical_features:
+            X[c] = pd.to_numeric(X[c], errors="coerce")
+    return X
+
+
+def detect_categorical(df: pd.DataFrame, features: List[str], args: argparse.Namespace) -> Tuple[List[str], List[str]]:
+    categorical = []
+    for c in features:
+        if c == "FEATURE":
+            categorical.append(c)
+        elif df[c].dtype == "object" or str(df[c].dtype).startswith("category"):
+            # High-cardinality raw sequence hashes are still useful as categorical in CatBoost,
+            # but sklearn fallback will ordinal-encode them.
+            categorical.append(c)
+    if args.force_categorical:
+        categorical = sorted(set(categorical).union({clean_col_name(x) for x in args.force_categorical.split(",") if x.strip()}))
+    numeric = [c for c in features if c not in set(categorical)]
+    return categorical, numeric
+
+
+def fit_model(train_df: pd.DataFrame, valid_df: pd.DataFrame, label_col: str, features: List[str], categorical_features: List[str], backend: str, args: argparse.Namespace):
+    X_train = prepare_X(train_df, features, categorical_features)
+    y_train = train_df[label_col].astype(str)
+    sample_weight = safe_numeric(train_df.get("TRAINING_WEIGHT", pd.Series(np.ones(len(train_df)), index=train_df.index)), 1.0).values
+    X_valid = prepare_X(valid_df, features, categorical_features) if valid_df is not None and len(valid_df) else None
+    y_valid = valid_df[label_col].astype(str) if valid_df is not None and len(valid_df) else None
+    backend = backend.lower()
+    if backend == "catboost":
+        from catboost import CatBoostClassifier
+        cat_idx = [X_train.columns.get_loc(c) for c in categorical_features if c in X_train.columns]
+        model = CatBoostClassifier(
+            iterations=int(args.iterations),
+            depth=int(args.depth),
+            learning_rate=float(args.learning_rate),
+            loss_function="MultiClass",
+            eval_metric="TotalF1",
+            random_seed=int(args.random_state),
+            auto_class_weights="Balanced" if args.auto_class_weights else None,
+            allow_writing_files=False,
+            thread_count=int(args.threads),
+        )
+        fit_kwargs = {"cat_features": cat_idx, "sample_weight": sample_weight, "verbose": int(args.train_verbose)}
+        if X_valid is not None and y_valid is not None and len(valid_df):
+            fit_kwargs["eval_set"] = (X_valid, y_valid)
+            fit_kwargs["use_best_model"] = True
+            fit_kwargs["early_stopping_rounds"] = int(args.early_stopping_rounds)
+        model.fit(X_train, y_train, **fit_kwargs)
+        return model
+
+    # Sklearn/lightgbm fallback pipeline.
+    from sklearn.compose import ColumnTransformer
+    from sklearn.impute import SimpleImputer
+    from sklearn.pipeline import Pipeline
+    from sklearn.preprocessing import OrdinalEncoder
+
+    numeric_features = [c for c in features if c not in set(categorical_features)]
+    pre = ColumnTransformer(
+        transformers=[
+            ("cat", Pipeline([("imputer", SimpleImputer(strategy="constant", fill_value="__MISSING__")), ("encoder", OrdinalEncoder(handle_unknown="use_encoded_value", unknown_value=-1))]), categorical_features),
+            ("num", SimpleImputer(strategy="median"), numeric_features),
+        ],
+        remainder="drop",
+    )
+    if backend == "lightgbm":
+        import lightgbm as lgb
+        est = lgb.LGBMClassifier(
+            objective="multiclass",
+            n_estimators=int(args.iterations),
+            learning_rate=float(args.learning_rate),
+            num_leaves=int(args.num_leaves),
+            class_weight="balanced" if args.auto_class_weights else None,
+            random_state=int(args.random_state),
+            n_jobs=int(args.threads),
+        )
+    elif backend == "randomforest":
+        from sklearn.ensemble import RandomForestClassifier
+        est = RandomForestClassifier(n_estimators=int(args.n_estimators), max_depth=None if int(args.max_depth) <= 0 else int(args.max_depth), class_weight="balanced_subsample" if args.auto_class_weights else None, random_state=int(args.random_state), n_jobs=int(args.threads))
+    elif backend == "extratrees":
+        from sklearn.ensemble import ExtraTreesClassifier
+        est = ExtraTreesClassifier(n_estimators=int(args.n_estimators), max_depth=None if int(args.max_depth) <= 0 else int(args.max_depth), class_weight="balanced" if args.auto_class_weights else None, random_state=int(args.random_state), n_jobs=int(args.threads))
+    elif backend == "logreg":
+        from sklearn.linear_model import LogisticRegression
+        est = LogisticRegression(max_iter=int(args.iterations), class_weight="balanced" if args.auto_class_weights else None, n_jobs=int(args.threads), multi_class="auto")
+    elif backend == "histgb":
+        from sklearn.ensemble import HistGradientBoostingClassifier
+        est = HistGradientBoostingClassifier(max_iter=int(args.iterations), learning_rate=float(args.learning_rate), random_state=int(args.random_state))
+    else:
+        raise ValueError(f"Unknown backend: {backend}")
+    model = Pipeline([("preprocess", pre), ("model", est)])
+    try:
+        model.fit(X_train, y_train, model__sample_weight=sample_weight)
+    except TypeError:
+        model.fit(X_train, y_train)
+    return model
+
+
+def predict_model(model, backend: str, df: pd.DataFrame, features: List[str], categorical_features: List[str]) -> Tuple[np.ndarray, Optional[np.ndarray], List[str]]:
+    X = prepare_X(df, features, categorical_features)
+    pred = model.predict(X)
+    pred = np.asarray(pred).reshape(-1)
+    proba = None
+    classes = []
+    if hasattr(model, "classes_"):
+        classes = [str(x) for x in list(model.classes_)]
+    elif hasattr(model, "named_steps") and hasattr(model.named_steps.get("model"), "classes_"):
+        classes = [str(x) for x in list(model.named_steps["model"].classes_)]
+    try:
+        proba = model.predict_proba(X)
+    except Exception:
+        proba = None
+    return pred, proba, classes
+
+
+def evaluate_and_write(out_dir: Path, model, backend: str, train_df: pd.DataFrame, valid_df: pd.DataFrame, test_df: pd.DataFrame, label_col: str, features: List[str], categorical_features: List[str], args: argparse.Namespace) -> Dict[str, Any]:
+    header("STEP 3 - EVALUATE / REPORT")
+    from sklearn.metrics import accuracy_score, average_precision_score, balanced_accuracy_score, classification_report, confusion_matrix, f1_score, precision_recall_curve, roc_auc_score, roc_curve
+    y_true = test_df[label_col].astype(str).values
+    pred, proba, classes = predict_model(model, backend, test_df, features, categorical_features)
+    pred = np.asarray([str(x) for x in pred])
+    metrics: Dict[str, Any] = {
+        "rows": int(len(test_df)),
+        "classes": int(len(set(y_true))),
+        "accuracy": float(accuracy_score(y_true, pred)),
+        "balanced_accuracy": float(balanced_accuracy_score(y_true, pred)),
+        "macro_f1": float(f1_score(y_true, pred, average="macro", zero_division=0)),
+        "weighted_f1": float(f1_score(y_true, pred, average="weighted", zero_division=0)),
+    }
+    rep = classification_report(y_true, pred, output_dict=True, zero_division=0)
+    pd.DataFrame(rep).transpose().to_csv(out_dir / "classification_report.csv")
+    labels = sorted(set(y_true).union(set(pred)))
+    cm = confusion_matrix(y_true, pred, labels=labels)
+    pd.DataFrame(cm, index=[f"TRUE_{x}" for x in labels], columns=[f"PRED_{x}" for x in labels]).to_csv(out_dir / "confusion_matrix.csv")
+    row_sums = cm.sum(axis=1, keepdims=True)
+    cm_norm = np.divide(cm, np.maximum(row_sums, 1), where=np.maximum(row_sums, 1) != 0)
+    pd.DataFrame(cm_norm, index=[f"TRUE_{x}" for x in labels], columns=[f"PRED_{x}" for x in labels]).to_csv(out_dir / "confusion_matrix_normalized.csv")
+
+    out_pred = test_df[[c for c in ["ECGI", "FEATURE", label_col, "SEED_REVIEW_SCORE", "NORMAL_COHORT"] if c in test_df.columns]].copy()
+    out_pred["MODEL_PREDICTED_LABEL"] = pred
+    if proba is not None and classes:
+        for i, cls in enumerate(classes):
+            out_pred[f"PRED_PROBA_{cls}"] = proba[:, i]
+        problem_idx = [i for i, cls in enumerate(classes) if cls in PROBLEM_LABELS]
+        normal_idx = [i for i, cls in enumerate(classes) if cls in NORMAL_LABELS]
+        out_pred["ML_PROBLEM_PROBABILITY"] = proba[:, problem_idx].sum(axis=1) if problem_idx else 0.0
+        out_pred["MODEL_CONFIDENCE"] = proba.max(axis=1)
+        y_bin = np.array([1 if y in PROBLEM_LABELS else 0 for y in y_true])
+        if len(np.unique(y_bin)) == 2:
+            metrics["problem_auc_roc"] = float(roc_auc_score(y_bin, out_pred["ML_PROBLEM_PROBABILITY"]))
+            metrics["problem_average_precision"] = float(average_precision_score(y_bin, out_pred["ML_PROBLEM_PROBABILITY"]))
+    out_pred.to_csv(out_dir / "test_predictions.csv", index=False)
+
+    try:
+        import matplotlib.pyplot as plt
+        plots_dir = out_dir / "plots"; plots_dir.mkdir(parents=True, exist_ok=True)
+        # Normalized confusion matrix.
+        fig, ax = plt.subplots(figsize=(max(8, 0.6*len(labels)+4), max(7, 0.5*len(labels)+3)))
+        im = ax.imshow(cm_norm, aspect="auto")
+        ax.set_title("V9 grouped-test multiclass confusion matrix - row normalized")
+        ax.set_xticks(np.arange(len(labels))); ax.set_yticks(np.arange(len(labels)))
+        ax.set_xticklabels(labels, rotation=45, ha="right", fontsize=8); ax.set_yticklabels(labels, fontsize=8)
+        fig.colorbar(im, ax=ax, label="Row-normalized share")
+        fig.savefig(plots_dir / "01_confusion_matrix_normalized.png", dpi=160, bbox_inches="tight"); plt.close(fig)
+        # Problem-only confusion matrix.
+        problem_labels_present = [x for x in labels if x in PROBLEM_LABELS]
+        if problem_labels_present:
+            idx = [labels.index(x) for x in problem_labels_present]
+            sub = cm_norm[np.ix_(idx, idx)]
+            fig, ax = plt.subplots(figsize=(max(7, 0.8*len(idx)+4), max(6, 0.7*len(idx)+3)))
+            im = ax.imshow(sub, aspect="auto")
+            ax.set_title("Problem-cluster confusion matrix only")
+            ax.set_xticks(np.arange(len(idx))); ax.set_yticks(np.arange(len(idx)))
+            ax.set_xticklabels(problem_labels_present, rotation=45, ha="right", fontsize=8); ax.set_yticklabels(problem_labels_present, fontsize=8)
+            fig.colorbar(im, ax=ax, label="Row-normalized share")
+            fig.savefig(plots_dir / "02_problem_only_confusion_matrix.png", dpi=160, bbox_inches="tight"); plt.close(fig)
+        if proba is not None and classes:
+            y_bin = np.array([1 if y in PROBLEM_LABELS else 0 for y in y_true])
+            if len(np.unique(y_bin)) == 2:
+                fpr, tpr, _ = roc_curve(y_bin, out_pred["ML_PROBLEM_PROBABILITY"])
+                fig, ax = plt.subplots(figsize=(8, 6)); ax.plot(fpr, tpr, label=f"AUC={metrics.get('problem_auc_roc', np.nan):.3f}"); ax.plot([0,1],[0,1], linestyle="--", label="Random"); ax.set_title("Problem vs non-problem ROC"); ax.set_xlabel("False positive rate"); ax.set_ylabel("True positive rate"); ax.legend(); ax.grid(True, alpha=0.3); fig.savefig(plots_dir / "03_problem_vs_nonproblem_roc.png", dpi=160, bbox_inches="tight"); plt.close(fig)
+                prec, rec, _ = precision_recall_curve(y_bin, out_pred["ML_PROBLEM_PROBABILITY"])
+                fig, ax = plt.subplots(figsize=(8, 6)); ax.plot(rec, prec, label=f"AP={metrics.get('problem_average_precision', np.nan):.3f}"); ax.set_title("Problem vs non-problem precision-recall"); ax.set_xlabel("Recall"); ax.set_ylabel("Precision"); ax.legend(); ax.grid(True, alpha=0.3); fig.savefig(plots_dir / "04_problem_vs_nonproblem_pr.png", dpi=160, bbox_inches="tight"); plt.close(fig)
+            fig, ax = plt.subplots(figsize=(8, 6)); ax.hist(out_pred.get("MODEL_CONFIDENCE", pd.Series(dtype=float)), bins=50); ax.set_title("Model confidence distribution on test set"); ax.set_xlabel("MODEL_CONFIDENCE"); ax.set_ylabel("Rows"); ax.grid(True, alpha=0.3); fig.savefig(plots_dir / "05_model_confidence_distribution.png", dpi=160, bbox_inches="tight"); plt.close(fig)
+        # Feature importance if available.
+        imp = None
+        if backend == "catboost" and hasattr(model, "get_feature_importance"):
+            try:
+                imp = pd.DataFrame({"FEATURE": features, "IMPORTANCE": model.get_feature_importance()})
+            except Exception:
+                imp = None
+        elif hasattr(model, "named_steps") and hasattr(model.named_steps.get("model"), "feature_importances_"):
+            try:
+                # For pipelines, exact transformed feature names are hard; report estimator importances with generic index.
+                vals = model.named_steps["model"].feature_importances_
+                imp = pd.DataFrame({"FEATURE": [f"TRANSFORMED_{i}" for i in range(len(vals))], "IMPORTANCE": vals})
+            except Exception:
+                imp = None
+        if imp is not None and not imp.empty:
+            imp = imp.sort_values("IMPORTANCE", ascending=False)
+            imp.to_csv(out_dir / "feature_importance.csv", index=False)
+            top = imp.head(40).iloc[::-1]
+            fig, ax = plt.subplots(figsize=(12, 9)); ax.barh(top["FEATURE"].astype(str), top["IMPORTANCE"]); ax.set_title("Top model feature importance"); ax.set_xlabel("Importance"); fig.savefig(plots_dir / "06_feature_importance_top40.png", dpi=160, bbox_inches="tight"); plt.close(fig)
+    except Exception as exc:
+        log(f"Plot creation skipped/partially failed: {exc}", indent=1)
+
+    (out_dir / "test_metrics.json").write_text(json.dumps(metrics, indent=2), encoding="utf-8")
+    log(f"Test metrics: {metrics}", indent=1)
+    return metrics
+
+
+def write_artifact(out_dir: Path, backend: str, model, features: List[str], categorical_features: List[str], numeric_features: List[str], classes: List[str], metrics: Dict[str, Any], feature_policy: pd.DataFrame, args: argparse.Namespace) -> Path:
+    model_dir = out_dir / backend
+    model_dir.mkdir(parents=True, exist_ok=True)
+    artifact = {
+        "script_version": SCRIPT_VERSION,
+        "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "backend": backend,
+        "model": model,
+        "features": features,
+        "categorical_features": categorical_features,
+        "numeric_features": numeric_features,
+        "classes": classes,
+        "problem_labels": sorted(PROBLEM_LABELS),
+        "normal_labels": sorted(NORMAL_LABELS),
+        "feature_policy": feature_policy.to_dict(orient="records"),
+        "metrics": metrics,
+        "calibration_enabled": False,
+        "reference_fields_excluded_from_model": True,
+        "feature_evidence_score_excluded_from_model": True,
+        "args": vars(args),
+    }
+    artifact_path = model_dir / f"cesmlc_v9_{backend}_problem_state_model_artifact.pkl"
+    with artifact_path.open("wb") as f:
+        pickle.dump(artifact, f)
+    (model_dir / "artifact_path.txt").write_text(str(artifact_path), encoding="utf-8")
+    feature_policy.to_csv(model_dir / "model_input_column_policy_used.csv", index=False)
+    report = [
+        "# CESMLC V9 model training report",
+        "",
+        f"Backend: `{backend}`",
+        f"Artifact: `{artifact_path}`",
+        f"Features used: **{len(features):,}**",
+        f"Categorical features: **{len(categorical_features):,}**",
+        f"Numeric features: **{len(numeric_features):,}**",
+        "",
+        "## Key guardrails",
+        "- REFERENCE_/DATA_SOURCE_/RCA fields excluded from model inputs.",
+        "- FEATURE_EVIDENCE_SCORE and FEATURE_EVIDENCE_PERCENTILE excluded from model inputs.",
+        "- RULE_/SEED_/EVIDENCE_/MANUAL/report fields excluded from model inputs.",
+        "",
+        "## Test metrics",
+    ]
+    for k, v in metrics.items():
+        report.append(f"- {k}: `{v}`")
+    (model_dir / "training_report.md").write_text("\n".join(report), encoding="utf-8")
+    return artifact_path
+
+
+def main() -> int:
+    args = parse_args()
+    dataset_path = Path(args.dataset).expanduser()
+    out_dir = Path(args.out_dir).expanduser(); out_dir.mkdir(parents=True, exist_ok=True)
+    header("CESMLC V9 PROBLEM-STATE MODEL TRAINER")
+    backend = choose_backend(args.model)
+    log(f"Selected backend: {backend}")
+    df = load_dataset(dataset_path, args)
+    label_col = clean_col_name(args.label_col)
+    features, feature_policy = infer_feature_columns(df, dataset_path, args)
+    categorical_features, numeric_features = detect_categorical(df, features, args)
+    log(f"Model feature count: {len(features):,}; categorical={len(categorical_features):,}; numeric={len(numeric_features):,}", indent=1)
+    log(f"Categorical feature sample: {categorical_features[:20]}", indent=1)
+    train_df, valid_df, test_df = split_grouped(df, label_col, args)
+    log(f"Model-train rows: {len(train_df):,}; validation rows: {len(valid_df):,}; test rows: {len(test_df):,}", indent=1)
+    model_dir = out_dir / backend; model_dir.mkdir(parents=True, exist_ok=True)
+    feature_policy.to_csv(model_dir / "model_input_column_policy_pre_fit.csv", index=False)
+    model = fit_model(train_df, valid_df, label_col, features, categorical_features, backend, args)
+    pred, proba, classes = predict_model(model, backend, test_df.head(min(len(test_df), 10)), features, categorical_features)
+    if not classes:
+        try:
+            classes = [str(x) for x in model.classes_]
+        except Exception:
+            classes = sorted(df[label_col].unique().astype(str).tolist())
+    metrics = evaluate_and_write(model_dir, model, backend, train_df, valid_df, test_df, label_col, features, categorical_features, args)
+    artifact_path = write_artifact(out_dir, backend, model, features, categorical_features, numeric_features, classes, metrics, feature_policy, args)
+    header("DONE")
+    log(f"Artifact: {artifact_path}")
+    log(f"Open report: {artifact_path.parent / 'training_report.md'}")
+    return 0
+
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="CESMLC V9 reference-safe problem-state model trainer.")
+    p.add_argument("--dataset", required=True, type=str)
+    p.add_argument("--out-dir", required=True, type=str)
+    p.add_argument("--model", default="auto", choices=["auto", "catboost", "lightgbm", "histgb", "randomforest", "extratrees", "logreg"])
+    p.add_argument("--label-col", default="FINAL_TRAINING_LABEL", type=str)
+    p.add_argument("--feature-policy", default=None, type=str)
+    p.add_argument("--split-mode", default="group", choices=["group", "row"])
+    p.add_argument("--test-size", default=0.25, type=float)
+    p.add_argument("--eval-size", default=0.20, type=float)
+    p.add_argument("--min-class-count", default=2, type=int)
+    p.add_argument("--random-state", default=42, type=int)
+    p.add_argument("--iterations", default=250, type=int)
+    p.add_argument("--early-stopping-rounds", default=30, type=int)
+    p.add_argument("--learning-rate", default=0.08, type=float)
+    p.add_argument("--depth", default=8, type=int)
+    p.add_argument("--num-leaves", default=64, type=int)
+    p.add_argument("--n-estimators", default=300, type=int)
+    p.add_argument("--max-depth", default=0, type=int)
+    p.add_argument("--threads", default=1, type=int)
+    p.add_argument("--train-verbose", default=25, type=int)
+    p.add_argument("--auto-class-weights", action="store_true", default=True)
+    p.add_argument("--no-auto-class-weights", action="store_false", dest="auto_class_weights")
+    p.add_argument("--allow-db-fields-for-model", action="store_true")
+    p.add_argument("--allow-identifier-fields-for-model", action="store_true")
+    p.add_argument("--exclude-columns", default=None, type=str)
+    p.add_argument("--include-only-columns", default=None, type=str)
+    p.add_argument("--force-categorical", default=None, type=str)
+    return p.parse_args()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
