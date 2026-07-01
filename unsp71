@@ -1,0 +1,1787 @@
+
+
+
+python "C:\Users\mk8753\OneDrive - AT&T Services, Inc\Desktop\works_desk\ML1\src\anomaly_detection_2\cesmlc_v71_seed_label_dataset_builder.py" `
+  --input "C:\Temp\enmt_cesmlc_lte_audit_p_akr3aesme01_35d_withDB_v3.csv" `
+  --days 35 `
+  --out-dir "C:\Temp\cesmlc_v71_seed_akr3aesme01_35d_outputs" `
+  --include-features "PHYSICALCELLID,CELLNAME,CELLTYPE,ANTENNALAT,ANTENNALON,ANTENNAORIENTATION,ANTENNAOPENING,ANTENNAHORIZONTALRANGE,ANTENNABASEALTITUDE,GEOTYPE,RADIUS1,SRVNGAREAAVERAGEALT,SRVNGAREAAVGALTUNCERT,SUPPORTEDTECHNOLOGIES" `
+  --reference-source-dir "C:\Temp\ran_reference_sources" `
+  --defaults-json "C:\Users\mk8753\OneDrive - AT&T Services, Inc\Desktop\works_desk\ML1\src\anomaly_detection_2\v62_cesmlc_feature_rules_template.json" `
+  --reuse-history-cache `
+  --history-cache-dir "C:\Temp\cesmlc_history_cache_akr3aesme01_35d" `
+  --cache-match-mode compatible `
+  --cache-input-identity basename `
+  --latlon-decimals 5 `
+  --memory-limit 6GB `
+  --threads 1 `
+  --feature-batch-size 1 `
+  --duckdb-temp-dir "C:\Temp\duckdb_spill_v71" `
+  --enable-isolation-forest `
+  --isolation-fit-sample 300000 `
+  --isolation-n-estimators 200 `
+  --isolation-score-weight 0.10 `
+  --isolation-top-percentile 98 `
+  --featurewise-isolation-fit-sample 100000 `
+  --featurewise-isolation-min-rows 2000 `
+  --final-report-top-n 100 `
+  --cluster-report-top-n 30 `
+  --plot-story-count 5 `
+  --plot-ecgi-multifeature-count 5
+
+
+
+
+#!/usr/bin/env python
+"""
+CESMLC V7.1 - stronger hybrid anomaly detector / report enhancer
+=================================================================
+
+Place this file in the same folder as your existing:
+    cesmlc_v7_seed_label_dataset_builder.py
+
+V7.1 imports your existing V7 builder and overrides the parts that need to be
+stronger:
+  - cache matching and diagnostics
+  - engineered anomaly features
+  - chunked global + feature-wise IsolationForest scoring
+  - anomaly fusion into primary_anomaly_cluster / primary_abnormal_feature
+  - top-100 and top-30-per-cluster markdown reports
+  - abnormal days / abnormal amount presentation
+  - visual plots, including abnormal-vs-low-risk history comparison stories
+
+The original V7 extraction pipeline remains intact, so this is a drop-in
+upgrade rather than a risky rewrite of the heavy DuckDB ingestion code.
+"""
+
+from __future__ import annotations
+
+import argparse
+import html
+import json
+import math
+import os
+import re
+import sys
+import time
+import traceback
+from pathlib import Path
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+
+import numpy as np
+import pandas as pd
+
+try:
+    import cesmlc_v7_seed_label_dataset_builder as base
+except Exception as exc:  # pragma: no cover - this is for the user's runtime folder
+    print("\nERROR: V7.1 must be placed next to cesmlc_v7_seed_label_dataset_builder.py")
+    print("Could not import the existing V7 builder.")
+    print(f"Import error: {exc}\n")
+    raise
+
+SCRIPT_VERSION = "7.1.0-hybrid-signature-isof-clustered-report-cache-visuals"
+base.SCRIPT_VERSION = SCRIPT_VERSION
+
+ORIG_WRITE_OUTPUTS = base.write_outputs
+ORIG_MANIFEST_HASH = base.manifest_hash
+
+
+# ---------------------------------------------------------------------------
+# Small helpers
+# ---------------------------------------------------------------------------
+
+
+def _series_num(df: pd.DataFrame, col: str, default: float = 0.0) -> pd.Series:
+    if col in df.columns:
+        return base.safe_numeric(df[col], default)
+    return pd.Series(default, index=df.index, dtype="float64")
+
+
+def _series_text(df: pd.DataFrame, col: str, default: str = "") -> pd.Series:
+    if col in df.columns:
+        return df[col].fillna(default).astype(str)
+    return pd.Series(default, index=df.index, dtype="object")
+
+
+def _clean_feature_list(features: Sequence[Any]) -> List[str]:
+    return sorted({base.clean_col_name(x) for x in features if str(x).strip()})
+
+
+def _safe_float(x: Any, default: float = 0.0) -> float:
+    try:
+        v = float(x)
+        return v if math.isfinite(v) else default
+    except Exception:
+        return default
+
+
+def _short(v: Any, n: int = 90) -> str:
+    try:
+        return base.short_value(v, max_len=n)
+    except Exception:
+        s = "" if pd.isna(v) else str(v)
+        return s if len(s) <= n else s[: n - 3] + "..."
+
+
+def _safe_filename(s: Any, max_len: int = 120) -> str:
+    s = str(s or "")
+    s = re.sub(r"[^A-Za-z0-9._-]+", "_", s).strip("_")
+    return (s[:max_len] or "item")
+
+
+def _date_str(x: Any) -> str:
+    try:
+        dt = pd.to_datetime(x, errors="coerce")
+        if pd.isna(dt):
+            return ""
+        return str(dt.date())
+    except Exception:
+        return ""
+
+
+def _feature_family(feature: Any) -> str:
+    f = base.clean_col_name(feature)
+    if f in {"ANTENNALAT", "ANTENNALON"}:
+        return "LOCATION"
+    if any(t in f for t in ["ORIENTATION", "OPENING", "AZIMUTH", "BEAM", "HORIZONTALRANGE", "RADIUS"]):
+        return "RF_COVERAGE"
+    if any(t in f for t in ["ALT", "ALTITUDE", "UNCERT"]):
+        return "ALTITUDE"
+    if f in {"PHYSICALCELLID", "CELLNAME", "CELLTYPE", "GEOTYPE"} or "CELL" in f:
+        return "CELL_IDENTITY"
+    if "TECH" in f:
+        return "TECHNOLOGY"
+    return "OTHER"
+
+
+def _severity_band_from_risk(x: Any) -> str:
+    v = _safe_float(x)
+    if v >= 85:
+        return "CRITICAL"
+    if v >= 70:
+        return "HIGH"
+    if v >= 50:
+        return "MEDIUM"
+    if v >= 30:
+        return "LOW"
+    return "LOW_RISK_OR_INFORMATIONAL"
+
+
+# ---------------------------------------------------------------------------
+# Cache V7.1: compatible reuse + real diagnostics
+# ---------------------------------------------------------------------------
+
+
+def manifest_hash(manifest: Dict[str, Any]) -> str:
+    comparable = {k: v for k, v in manifest.items() if not str(k).startswith("_")}
+    raw = json.dumps(comparable, sort_keys=True, default=str).encode("utf-8")
+    import hashlib
+
+    return hashlib.sha256(raw).hexdigest()[:16]
+
+
+def cache_manifest_for_run(input_path: Path, features: List[str], analysis_info: Dict[str, Any], args: argparse.Namespace) -> Dict[str, Any]:
+    p = Path(input_path)
+    stat = p.stat() if p.exists() else None
+    return {
+        "script_family": "cesmlc_source_history_cache_v2",
+        "cache_schema_version": "7.1",
+        "input_file": str(p),
+        "input_file_name": p.name,
+        "input_size_bytes": int(stat.st_size) if stat else None,
+        "input_mtime": float(stat.st_mtime) if stat else None,
+        "requested_days": int(analysis_info.get("requested_days", getattr(args, "days", 30))),
+        "window_start_date": analysis_info.get("window_start_date"),
+        "window_end_date": analysis_info.get("window_end_date"),
+        "candidate_date": analysis_info.get("candidate_date"),
+        "features": _clean_feature_list(features),
+        "latlon_decimals": int(getattr(args, "latlon_decimals", 5)),
+        "enable_db_push_check": bool(getattr(args, "enable_db_push_check", False)),
+        "server_id_filter": str(analysis_info.get("server_id_filter", "") or "").upper(),
+        "_cache_match_mode": getattr(args, "cache_match_mode", "compatible"),
+        "_cache_input_identity": getattr(args, "cache_input_identity", "basename"),
+    }
+
+
+def _normalize_manifest_for_compare(m: Dict[str, Any]) -> Dict[str, Any]:
+    out = dict(m or {})
+    if "features" in out:
+        out["features"] = _clean_feature_list(out.get("features") or [])
+    if "server_id_filter" in out:
+        out["server_id_filter"] = str(out.get("server_id_filter") or "").upper()
+    if "input_file_name" not in out and out.get("input_file"):
+        try:
+            out["input_file_name"] = Path(str(out["input_file"])).name
+        except Exception:
+            out["input_file_name"] = ""
+    for c in ["requested_days", "latlon_decimals"]:
+        if c in out and out[c] is not None:
+            try:
+                out[c] = int(out[c])
+            except Exception:
+                pass
+    if "enable_db_push_check" in out:
+        out["enable_db_push_check"] = bool(out["enable_db_push_check"])
+    return out
+
+
+def _cache_semantic_diffs(saved_manifest: Dict[str, Any], expected_manifest: Dict[str, Any]) -> Tuple[bool, List[Dict[str, Any]], List[str]]:
+    saved = _normalize_manifest_for_compare(saved_manifest)
+    expected = _normalize_manifest_for_compare(expected_manifest)
+    mode = str(expected.get("_cache_match_mode", "compatible")).lower()
+    input_identity = str(expected.get("_cache_input_identity", "basename")).lower()
+
+    ignored: List[str] = []
+    diffs: List[Dict[str, Any]] = []
+
+    if mode in {"trust_existing", "trust", "unsafe"}:
+        return True, [], ["trusted existing cache by --cache-match-mode trust_existing"]
+
+    core_keys = [
+        "window_start_date",
+        "window_end_date",
+        "candidate_date",
+        "features",
+        "latlon_decimals",
+        "enable_db_push_check",
+        "server_id_filter",
+    ]
+
+    # requested_days can differ while the actual window is identical because a file has extra days.
+    # Compare it in strict mode only; otherwise the selected start/end window is the source of truth.
+    if mode == "strict":
+        core_keys.insert(0, "requested_days")
+
+    for k in core_keys:
+        if saved.get(k) != expected.get(k):
+            diffs.append({"key": k, "cached": saved.get(k), "current": expected.get(k)})
+
+    if mode == "strict":
+        strict_keys = ["input_file", "input_size_bytes", "input_mtime"]
+        for k in strict_keys:
+            if saved.get(k) != expected.get(k):
+                diffs.append({"key": k, "cached": saved.get(k), "current": expected.get(k)})
+    elif mode == "compatible":
+        if input_identity == "exact" and saved.get("input_file") != expected.get("input_file"):
+            diffs.append({"key": "input_file", "cached": saved.get("input_file"), "current": expected.get("input_file")})
+        elif input_identity == "basename" and saved.get("input_file_name") != expected.get("input_file_name"):
+            diffs.append({"key": "input_file_name", "cached": saved.get("input_file_name"), "current": expected.get("input_file_name")})
+        else:
+            ignored.append("input_file identity ignored") if input_identity == "none" else None
+        ignored.extend(["input_mtime", "input_size_bytes", "script_family/cache_schema_version"])
+    elif mode == "loose":
+        ignored.extend(["input_file", "input_file_name", "input_mtime", "input_size_bytes", "requested_days", "script_family/cache_schema_version"])
+    else:
+        diffs.append({"key": "_cache_match_mode", "cached": "n/a", "current": mode})
+
+    return len(diffs) == 0, diffs, ignored
+
+
+def _write_cache_diag(cache_dir: Path, payload: Dict[str, Any]) -> None:
+    try:
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        (cache_dir / "cache_load_diagnostics_v71.json").write_text(json.dumps(payload, indent=2, default=str), encoding="utf-8")
+    except Exception:
+        pass
+
+
+def _validate_cache_tables(candidates: pd.DataFrame, hist: pd.DataFrame, changes: pd.DataFrame, conflicts: pd.DataFrame) -> Tuple[bool, List[str]]:
+    problems: List[str] = []
+    if candidates is None or hist is None:
+        problems.append("candidate/history table is missing")
+        return False, problems
+    for name, df, cols in [
+        ("candidate_ecgis.pkl", candidates, ["ECGI"]),
+        ("source_feature_history_metrics.pkl", hist, ["ECGI", "FEATURE", "LATEST_SOURCE_VALUE"]),
+        ("source_change_events.pkl", changes, ["ECGI", "FEATURE"]),
+        ("source_same_day_conflicts.pkl", conflicts, ["ECGI", "FEATURE"]),
+    ]:
+        if not isinstance(df, pd.DataFrame):
+            problems.append(f"{name} is not a pandas DataFrame")
+            continue
+        missing = [c for c in cols if c not in df.columns]
+        if missing:
+            problems.append(f"{name} missing columns: {missing}")
+    return len(problems) == 0, problems
+
+
+def load_history_cache_if_valid(
+    cache_dir: Path, expected_manifest: Dict[str, Any], force_rebuild: bool = False
+) -> Optional[Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]]:
+    mode = str(expected_manifest.get("_cache_match_mode", "compatible"))
+    if force_rebuild:
+        base.log("History cache rebuild forced by --force-rebuild-history-cache", indent=1)
+        _write_cache_diag(cache_dir, {"status": "force_rebuild", "expected_manifest": expected_manifest})
+        return None
+
+    manifest_path = cache_dir / "history_cache_manifest.json"
+    files = [
+        cache_dir / "candidate_ecgis.pkl",
+        cache_dir / "source_feature_history_metrics.pkl",
+        cache_dir / "source_change_events.pkl",
+        cache_dir / "source_same_day_conflicts.pkl",
+    ]
+
+    diag: Dict[str, Any] = {
+        "cache_dir": str(cache_dir),
+        "cache_match_mode": mode,
+        "expected_hash": manifest_hash(expected_manifest),
+        "expected_manifest": expected_manifest,
+        "checked_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+    }
+
+    missing = [str(p) for p in [manifest_path, *files] if not p.exists()]
+    if missing:
+        base.log(f"No reusable history cache yet. Missing {len(missing)} required file(s) in: {cache_dir}", indent=1)
+        for p in missing[:6]:
+            base.log(f"missing: {p}", indent=2)
+        diag.update({"status": "missing_files", "missing_files": missing})
+        _write_cache_diag(cache_dir, diag)
+        return None
+
+    try:
+        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        base.log(f"History cache manifest exists but cannot be read: {exc}", indent=1)
+        diag.update({"status": "bad_manifest", "error": str(exc)})
+        _write_cache_diag(cache_dir, diag)
+        return None
+
+    saved_manifest = payload.get("manifest", {}) or {}
+    saved_hash = payload.get("manifest_hash")
+    expected_hash = manifest_hash(expected_manifest)
+    diag.update({"cached_hash": saved_hash, "cached_manifest": saved_manifest})
+
+    exact_hash_match = bool(saved_hash == expected_hash)
+    semantic_match, diffs, ignored = _cache_semantic_diffs(saved_manifest, expected_manifest)
+    diag.update({"exact_hash_match": exact_hash_match, "semantic_match": semantic_match, "diffs": diffs, "ignored_differences": ignored})
+
+    if not exact_hash_match:
+        if semantic_match:
+            base.log(
+                f"History cache hash differs but is semantically compatible under --cache-match-mode={mode}; reusing cache.",
+                indent=1,
+            )
+            if ignored:
+                base.log(f"Ignored cache differences: {', '.join(ignored)}", indent=2)
+        else:
+            base.log(f"History cache exists but is not reusable under --cache-match-mode={mode}.", indent=1)
+            for d in diffs[:12]:
+                base.log(f"diff {d['key']}: cached={d.get('cached')} current={d.get('current')}", indent=2)
+            base.log("Use the matching cache folder/window, use --cache-match-mode loose only when you know it is safe, or rebuild.", indent=2)
+            diag.update({"status": "manifest_mismatch"})
+            _write_cache_diag(cache_dir, diag)
+            return None
+    else:
+        base.log(f"History cache hash matches exactly; reusing cache: {cache_dir}", indent=1)
+
+    try:
+        candidates = pd.read_pickle(files[0])
+        hist = pd.read_pickle(files[1])
+        changes = pd.read_pickle(files[2])
+        conflicts = pd.read_pickle(files[3])
+    except Exception as exc:
+        base.log(f"Could not load history cache pickles; rebuilding. Error: {exc}", indent=1)
+        diag.update({"status": "pickle_load_failed", "error": str(exc), "traceback": traceback.format_exc()})
+        _write_cache_diag(cache_dir, diag)
+        return None
+
+    ok, problems = _validate_cache_tables(candidates, hist, changes, conflicts)
+    if not ok:
+        base.log("History cache tables failed schema validation; rebuilding.", indent=1)
+        for p in problems[:8]:
+            base.log(p, indent=2)
+        diag.update({"status": "schema_validation_failed", "problems": problems})
+        _write_cache_diag(cache_dir, diag)
+        return None
+
+    base.log(f"Loaded persistent Phase 1C history cache: {cache_dir}", indent=1)
+    base.log(
+        f"Cached rows: candidates={len(candidates):,}, hist={len(hist):,}, changes={len(changes):,}, conflicts={len(conflicts):,}",
+        indent=1,
+    )
+    diag.update(
+        {
+            "status": "loaded",
+            "rows": {
+                "candidates": len(candidates),
+                "hist": len(hist),
+                "changes": len(changes),
+                "conflicts": len(conflicts),
+            },
+        }
+    )
+    _write_cache_diag(cache_dir, diag)
+    return candidates, hist, changes, conflicts
+
+
+def save_history_cache(
+    cache_dir: Path,
+    manifest: Dict[str, Any],
+    candidates: pd.DataFrame,
+    hist: pd.DataFrame,
+    changes: pd.DataFrame,
+    conflicts: pd.DataFrame,
+) -> None:
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    mh = manifest_hash(manifest)
+    payload = {
+        "manifest": {k: v for k, v in manifest.items() if not str(k).startswith("_")},
+        "manifest_hash": mh,
+        "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "rows": {
+            "candidates": int(len(candidates)),
+            "hist": int(len(hist)),
+            "changes": int(len(changes)),
+            "conflicts": int(len(conflicts)),
+        },
+        "cache_notes": "V7.1 compatible cache. input_mtime is retained for diagnostics but ignored by compatible/loose matching.",
+    }
+    (cache_dir / "history_cache_manifest.json").write_text(json.dumps(payload, indent=2, default=str), encoding="utf-8")
+    (cache_dir / "history_cache_manifest_v71.json").write_text(json.dumps(payload, indent=2, default=str), encoding="utf-8")
+    candidates.to_pickle(cache_dir / "candidate_ecgis.pkl")
+    hist.to_pickle(cache_dir / "source_feature_history_metrics.pkl")
+    changes.to_pickle(cache_dir / "source_change_events.pkl")
+    conflicts.to_pickle(cache_dir / "source_same_day_conflicts.pkl")
+    base.log(f"Saved persistent Phase 1C history cache: {cache_dir} (hash={mh})", indent=1)
+
+
+# ---------------------------------------------------------------------------
+# Engineered features and stronger IsolationForest
+# ---------------------------------------------------------------------------
+
+
+def add_v71_engineered_features(dataset: pd.DataFrame) -> pd.DataFrame:
+    fm = dataset.copy()
+    if fm.empty:
+        return fm
+
+    analysis_days = _series_num(fm, "ANALYSIS_DAYS", 30).replace(0, 30).clip(lower=1)
+    observed_days = _series_num(fm, "OBSERVED_DAYS_FOR_FEATURE", 0).replace(0, np.nan)
+    change_days = _series_num(fm, "SOURCE_CHANGE_DAYS_COUNT", 0)
+    change_count = _series_num(fm, "SOURCE_CHANGE_COUNT", 0)
+    conflict_days = _series_num(fm, "SOURCE_SAME_DAY_CONFLICT_DAYS", 0)
+    db_mismatch_days = _series_num(fm, "SOURCE_DB_MISMATCH_DAYS", 0)
+    distinct_values = _series_num(fm, "DISTINCT_SOURCE_VALUES_30D", 0)
+    mode_share = _series_num(fm, "MODE_SOURCE_VALUE_SHARE_PERCENT", 100).clip(lower=0, upper=100)
+    days_since_last = _series_num(fm, "DAYS_SINCE_LAST_SOURCE_CHANGE", 9999)
+    latest_value_days = _series_num(fm, "LATEST_SOURCE_VALUE_DAYS", 0)
+    latest_default = _series_num(fm, "LATEST_SOURCE_IS_DEFAULT_FLAG", 0)
+    invalid_flag = _series_num(fm, "LATEST_SOURCE_INVALID_RANGE_FLAG", 0)
+
+    fm["ABNORMAL_FEATURE_FAMILY"] = _series_text(fm, "FEATURE", "").map(_feature_family)
+    fm["CHANGE_DENSITY"] = (change_days / observed_days).replace([np.inf, -np.inf], np.nan).fillna(0).clip(lower=0, upper=1)
+    fm["EVENT_DENSITY"] = (change_count / observed_days).replace([np.inf, -np.inf], np.nan).fillna(0).clip(lower=0)
+    fm["VALUE_ENTROPY_PROXY"] = np.log1p(distinct_values.clip(lower=0)) * (1.0 - mode_share / 100.0)
+    fm["MODE_IMPURITY_PERCENT"] = (100.0 - mode_share).clip(lower=0, upper=100)
+    fm["RECENCY_PRESSURE"] = ((analysis_days - days_since_last.clip(upper=analysis_days)) / analysis_days).clip(lower=0, upper=1)
+    fm["INSTABILITY_EVENT_INDEX"] = (
+        2.2 * change_days
+        + 1.1 * change_count
+        + 2.5 * conflict_days
+        + 1.4 * db_mismatch_days
+        + 1.8 * _series_num(fm, "SOURCE_A_B_A_REVERT_COUNT", 0)
+        + 1.8 * _series_num(fm, "SOURCE_REVERSE_TRANSITION_COUNT", 0)
+        + 1.2 * distinct_values
+    )
+
+    latest_num = pd.to_numeric(_series_text(fm, "LATEST_SOURCE_VALUE", ""), errors="coerce")
+    prev_num = pd.to_numeric(_series_text(fm, "PREVIOUS_NONLATEST_SOURCE_VALUE", ""), errors="coerce")
+    mode_num = pd.to_numeric(_series_text(fm, "MODE_SOURCE_VALUE", ""), errors="coerce")
+    first_num = pd.to_numeric(_series_text(fm, "FIRST_SOURCE_VALUE", ""), errors="coerce")
+    db_num = pd.to_numeric(_series_text(fm, "LATEST_DB_VALUE", ""), errors="coerce")
+
+    fm["LATEST_PREVIOUS_NUMERIC_DELTA"] = (latest_num - prev_num).abs().replace([np.inf, -np.inf], np.nan).fillna(0)
+    fm["LATEST_MODE_NUMERIC_DELTA"] = (latest_num - mode_num).abs().replace([np.inf, -np.inf], np.nan).fillna(0)
+    fm["LATEST_FIRST_NUMERIC_DELTA"] = (latest_num - first_num).abs().replace([np.inf, -np.inf], np.nan).fillna(0)
+    fm["SOURCE_DB_NUMERIC_DELTA"] = (latest_num - db_num).abs().replace([np.inf, -np.inf], np.nan).fillna(0)
+    fm["ABNORMAL_AMOUNT_NUMERIC"] = fm[
+        ["LATEST_PREVIOUS_NUMERIC_DELTA", "LATEST_MODE_NUMERIC_DELTA", "LATEST_FIRST_NUMERIC_DELTA", "SOURCE_DB_NUMERIC_DELTA"]
+    ].max(axis=1)
+
+    fallback_duration_days = np.where(latest_default > 0, latest_value_days, 0)
+    fm["ABNORMAL_DAYS_COUNT"] = np.maximum.reduce(
+        [
+            change_days.fillna(0).to_numpy(dtype=float),
+            conflict_days.fillna(0).to_numpy(dtype=float),
+            db_mismatch_days.fillna(0).to_numpy(dtype=float),
+            fallback_duration_days.astype(float),
+            np.where(invalid_flag > 0, observed_days.fillna(analysis_days).to_numpy(dtype=float), 0.0),
+        ]
+    )
+    fm["ABNORMAL_DAYS_PERCENT"] = (100.0 * fm["ABNORMAL_DAYS_COUNT"] / analysis_days).replace([np.inf, -np.inf], np.nan).fillna(0).clip(0, 100)
+    fm["ABNORMAL_DAYS_PRESENTABLE"] = fm["ABNORMAL_DAYS_COUNT"].round(0).astype(int).astype(str) + "/" + analysis_days.round(0).astype(int).astype(str) + " days"
+
+    numeric_mask = fm["ABNORMAL_AMOUNT_NUMERIC"] > 0
+    fm["ABNORMAL_AMOUNT_PRESENTABLE"] = (
+        "distinct="
+        + distinct_values.round(0).astype(int).astype(str)
+        + "; changes="
+        + change_count.round(0).astype(int).astype(str)
+    )
+    fm.loc[numeric_mask, "ABNORMAL_AMOUNT_PRESENTABLE"] = "max Î=" + fm.loc[numeric_mask, "ABNORMAL_AMOUNT_NUMERIC"].map(lambda x: f"{x:.6g}")
+
+    # A compact explainability field that is safe for CSV and markdown.
+    fm["FEATURE_ABNORMALITY_BRIEF"] = (
+        _series_text(fm, "FEATURE", "")
+        + ": "
+        + fm["ABNORMAL_DAYS_PRESENTABLE"]
+        + ", "
+        + fm["ABNORMAL_AMOUNT_PRESENTABLE"]
+        + ", score="
+        + _series_num(fm, "SEED_RULE_SCORE", 0).round(1).astype(str)
+    )
+    return fm
+
+
+def _numeric_ml_columns(fm: pd.DataFrame) -> List[str]:
+    exclude_tokens = [
+        "LABEL",
+        "VALUE",
+        "DATE",
+        "SUMMARY",
+        "ACTION",
+        "REASON",
+        "SOURCE_FILE",
+        "SOURCE_NAME",
+        "REFERENCE_COLUMN",
+        "REFERENCE_KEY",
+        "ECGI",
+        "CELLNAME",
+        "MARKET",
+        "REGION",
+        "FEATURE",
+        "CLUSTER",
+        "PRESENTABLE",
+        "BRIEF",
+        "TEXT",
+        "PATH",
+    ]
+    numeric_cols: List[str] = []
+    for c in fm.columns:
+        cu = str(c).upper()
+        if any(tok in cu for tok in exclude_tokens):
+            continue
+        if pd.api.types.is_numeric_dtype(fm[c]):
+            numeric_cols.append(c)
+        else:
+            maybe = pd.to_numeric(fm[c], errors="coerce")
+            if len(maybe) and maybe.notna().mean() > 0.98:
+                fm[c] = maybe
+                numeric_cols.append(c)
+    return sorted(set(numeric_cols))
+
+
+def _parse_contamination(x: Any) -> Any:
+    s = str(x).strip().lower()
+    if s == "auto":
+        return "auto"
+    try:
+        v = float(s)
+        if 0 < v < 0.5:
+            return v
+    except Exception:
+        pass
+    return "auto"
+
+
+def _fit_score_isof(
+    fm: pd.DataFrame,
+    numeric_cols: List[str],
+    args: argparse.Namespace,
+    fit_sample: int,
+    row_index: Optional[pd.Index] = None,
+) -> np.ndarray:
+    from sklearn.ensemble import IsolationForest
+    from sklearn.impute import SimpleImputer
+    from sklearn.preprocessing import RobustScaler
+
+    if row_index is None:
+        row_index = fm.index
+    sub = fm.loc[row_index, numeric_cols].replace([np.inf, -np.inf], np.nan)
+    if len(sub) == 0:
+        return np.array([], dtype=float)
+
+    if fit_sample and len(sub) > int(fit_sample):
+        fit_df = sub.sample(n=int(fit_sample), random_state=int(getattr(args, "random_state", 42)))
+    else:
+        fit_df = sub
+
+    imputer = SimpleImputer(strategy="median")
+    scaler = RobustScaler(quantile_range=(10, 90))
+    X_fit = imputer.fit_transform(fit_df)
+    X_fit = scaler.fit_transform(X_fit)
+
+    model = IsolationForest(
+        n_estimators=int(getattr(args, "isolation_n_estimators", 200)),
+        contamination=_parse_contamination(getattr(args, "isolation_contamination", "auto")),
+        random_state=int(getattr(args, "random_state", 42)),
+        n_jobs=-1,
+        bootstrap=False,
+    )
+    model.fit(X_fit)
+
+    batch_size = max(1000, int(getattr(args, "isolation_score_batch_size", 250000)))
+    scores = np.empty(len(sub), dtype="float64")
+    for start in range(0, len(sub), batch_size):
+        end = min(start + batch_size, len(sub))
+        X = imputer.transform(sub.iloc[start:end])
+        X = scaler.transform(X)
+        scores[start:end] = -model.score_samples(X)
+    return scores
+
+
+def add_isolation_forest_scores(dataset: pd.DataFrame, args: argparse.Namespace) -> pd.DataFrame:
+    fm = dataset.copy()
+    fm["UNSUPERVISED_GLOBAL_ISOF_SCORE"] = np.nan
+    fm["UNSUPERVISED_GLOBAL_ISOF_PERCENTILE"] = np.nan
+    fm["UNSUPERVISED_FEATURE_ISOF_SCORE"] = np.nan
+    fm["UNSUPERVISED_FEATURE_ISOF_PERCENTILE"] = np.nan
+    fm["UNSUPERVISED_ISOF_SCORE"] = np.nan
+    fm["UNSUPERVISED_ISOF_PERCENTILE"] = np.nan
+    fm["UNSUPERVISED_ISOF_TOP_FLAG"] = 0
+
+    if not getattr(args, "enable_isolation_forest", False) or fm.empty:
+        return fm
+
+    try:
+        # Import here so non-ML runs do not require sklearn.
+        import sklearn  # noqa: F401
+    except Exception as exc:
+        base.log(f"IsolationForest skipped because scikit-learn is unavailable: {exc}", indent=1)
+        return fm
+
+    numeric_cols = _numeric_ml_columns(fm)
+    if len(numeric_cols) < 6 or len(fm) < 50:
+        base.log("IsolationForest skipped: not enough numeric features/rows after V7.1 feature engineering.", indent=1)
+        return fm
+
+    base.log(
+        f"V7.1 IsolationForest global scoring: rows={len(fm):,}, numeric_features={len(numeric_cols):,}, fit_sample={int(getattr(args, 'isolation_fit_sample', 300000)):,}",
+        indent=1,
+    )
+    try:
+        global_scores = _fit_score_isof(fm, numeric_cols, args, int(getattr(args, "isolation_fit_sample", 300000)))
+        fm["UNSUPERVISED_GLOBAL_ISOF_SCORE"] = global_scores
+        fm["UNSUPERVISED_GLOBAL_ISOF_PERCENTILE"] = base.percentile_rank(pd.Series(global_scores, index=fm.index))
+    except Exception as exc:
+        base.log(f"Global IsolationForest failed; continuing with rules only. Error: {exc}", indent=1)
+        base.log(traceback.format_exc().splitlines()[-1], indent=2)
+
+    if not getattr(args, "disable_featurewise_isolation", False) and "FEATURE" in fm.columns:
+        min_rows = int(getattr(args, "featurewise_isolation_min_rows", 2000))
+        fit_sample = int(getattr(args, "featurewise_isolation_fit_sample", 100000))
+        feature_groups = fm.groupby("FEATURE", sort=False).groups
+        base.log(f"V7.1 feature-wise IsolationForest enabled for groups with at least {min_rows:,} rows", indent=1)
+        feature_done = 0
+        for feature, idx in feature_groups.items():
+            idx = pd.Index(idx)
+            if len(idx) < min_rows:
+                continue
+            try:
+                scores = _fit_score_isof(fm, numeric_cols, args, fit_sample, row_index=idx)
+                fm.loc[idx, "UNSUPERVISED_FEATURE_ISOF_SCORE"] = scores
+                fm.loc[idx, "UNSUPERVISED_FEATURE_ISOF_PERCENTILE"] = base.percentile_rank(pd.Series(scores, index=idx)).values
+                feature_done += 1
+            except Exception as exc:
+                base.log(f"Feature-wise IsolationForest skipped for {feature}: {exc}", indent=2)
+        base.log(f"Feature-wise IsolationForest completed for {feature_done:,} feature group(s)", indent=1)
+
+    global_pct = _series_num(fm, "UNSUPERVISED_GLOBAL_ISOF_PERCENTILE", 0)
+    feature_pct = _series_num(fm, "UNSUPERVISED_FEATURE_ISOF_PERCENTILE", 0)
+    combined_pct = np.maximum(global_pct.fillna(0).to_numpy(dtype=float), feature_pct.fillna(0).to_numpy(dtype=float))
+    fm["UNSUPERVISED_ISOF_PERCENTILE"] = combined_pct
+    fm["UNSUPERVISED_ISOF_SCORE"] = combined_pct / 100.0
+    top_threshold = float(getattr(args, "isolation_top_percentile", 98.0))
+    fm["UNSUPERVISED_ISOF_TOP_FLAG"] = (fm["UNSUPERVISED_ISOF_PERCENTILE"] >= top_threshold).astype(int)
+
+    # Keep original rule score, then add only a controlled ML bump. The final risk score is computed separately.
+    fm["SEED_RULE_SCORE_BASE"] = _series_num(fm, "SEED_RULE_SCORE", 0)
+    bump = float(getattr(args, "isolation_score_weight", 0.10)) * (fm["UNSUPERVISED_ISOF_PERCENTILE"].fillna(0) / 100.0) * 20.0
+    fm["SEED_RULE_SCORE"] = (fm["SEED_RULE_SCORE_BASE"] + bump).clip(lower=0)
+    fm["SEED_RULE_PERCENTILE"] = base.percentile_rank(fm["SEED_RULE_SCORE"])
+    base.log(f"V7.1 IsolationForest scoring added. Top-flag rows: {int(fm['UNSUPERVISED_ISOF_TOP_FLAG'].sum()):,}", indent=1)
+    return fm
+
+
+# ---------------------------------------------------------------------------
+# Signature + ML fusion into primary clusters
+# ---------------------------------------------------------------------------
+
+
+SEED_TO_CLUSTER = {
+    "AUDIT_PUSH_NOT_APPLIED": "DB_PUSH_NOT_APPLIED",
+    "INVALID_LATEST_SOURCE_VALUE": "INVALID_SOURCE_VALUE",
+    "FALLBACK_TO_DEFAULT_VALUE": "DEFAULT_FALLBACK",
+    "FLUCTUATING_FALLBACK_TO_DEFAULT": "DEFAULT_FALLBACK_FLUCTUATING",
+    "LONG_TERM_FALLBACK_TO_DEFAULT": "DEFAULT_FALLBACK_LONG_TERM",
+    "REAL_BACK_AND_FORTH_INSTABILITY": "TOGGLING_BACK_AND_FORTH",
+    "HIGH_FREQUENCY_DIFFERENT_VALUES": "HIGH_FREQUENCY_MULTI_VALUE",
+    "SAME_DAY_SOURCE_CONFLICT": "SAME_DAY_CONFLICT",
+    "PERSISTENT_SOURCE_INSTABILITY": "PERSISTENT_SOURCE_INSTABILITY",
+    "LATEST_DAY_SOURCE_CHANGE": "LATEST_DAY_SOURCE_CHANGE",
+    "SUPPRESSED_NORMAL_STABLE_SOURCE_CHANGE": "LOW_RISK_REGULAR_CHANGE",
+    "SUPPRESSED_BULK_OR_REFRESH_PATTERN": "LOW_RISK_BULK_OR_REFRESH",
+    "SUPPRESSED_COORDINATED_MULTI_FIELD_CHANGE": "LOW_RISK_COORDINATED_CHANGE",
+    "DB_PUSH_CHECK_CANDIDATE_STABLE_SOURCE": "STABLE_DB_MISMATCH_REVIEW",
+    "LOW_INFORMATION_STABLE_SOURCE_HISTORY": "STABLE_DB_MISMATCH_REVIEW",
+    "LOW_PRIORITY_SOURCE_HISTORY_SIGNAL": "LOW_PRIORITY_HISTORY_SIGNAL",
+}
+
+REPORTABLE_CLUSTERS = {
+    "DB_PUSH_NOT_APPLIED",
+    "INVALID_SOURCE_VALUE",
+    "DEFAULT_FALLBACK",
+    "DEFAULT_FALLBACK_FLUCTUATING",
+    "DEFAULT_FALLBACK_LONG_TERM",
+    "TOGGLING_BACK_AND_FORTH",
+    "HIGH_FREQUENCY_MULTI_VALUE",
+    "SAME_DAY_CONFLICT",
+    "PERSISTENT_SOURCE_INSTABILITY",
+    "LATEST_DAY_SOURCE_CHANGE",
+    "UNSUPERVISED_OUTLIER_WITH_SIGNATURE",
+}
+
+
+def _map_cluster_from_seed(label: Any) -> str:
+    return SEED_TO_CLUSTER.get(str(label), "LOW_PRIORITY_HISTORY_SIGNAL")
+
+
+def apply_v71_anomaly_fusion(dataset: pd.DataFrame, args: argparse.Namespace) -> pd.DataFrame:
+    fm = dataset.copy()
+    if fm.empty:
+        return fm
+
+    fm["PRIMARY_ABNORMAL_FEATURE"] = _series_text(fm, "FEATURE", "")
+    fm["PRIMARY_ANOMALY_CLUSTER"] = _series_text(fm, "SEED_LABEL", "").map(_map_cluster_from_seed)
+
+    rule_problem = _series_num(fm, "IS_REPORTABLE_PROBLEM", 0).astype(int) == 1
+    low_risk = fm["PRIMARY_ANOMALY_CLUSTER"].str.startswith("LOW_RISK", na=False)
+    hold = fm["PRIMARY_ANOMALY_CLUSTER"].isin(["STABLE_DB_MISMATCH_REVIEW", "LOW_PRIORITY_HISTORY_SIGNAL"])
+    isof_top = _series_num(fm, "UNSUPERVISED_ISOF_TOP_FLAG", 0).astype(int) == 1
+    changed_enough = (
+        (_series_num(fm, "SOURCE_CHANGE_DAYS_COUNT", 0) >= int(getattr(args, "unsupervised_min_changed_days", 2)))
+        | (_series_num(fm, "DISTINCT_SOURCE_VALUES_30D", 0) >= int(getattr(args, "unsupervised_min_distinct_values", 2)))
+        | (_series_num(fm, "SOURCE_SAME_DAY_CONFLICT_DAYS", 0) > 0)
+        | (_series_num(fm, "SOURCE_DB_MISMATCH_DAYS", 0) > 0)
+    )
+    weak_signature = (
+        (_series_num(fm, "SEED_RULE_SCORE", 0) >= float(getattr(args, "unsupervised_min_rule_score", 18.0)))
+        | (_series_num(fm, "ABNORMAL_DAYS_COUNT", 0) >= int(getattr(args, "unsupervised_min_changed_days", 2)))
+        | (_series_num(fm, "INSTABILITY_EVENT_INDEX", 0) >= 5)
+    )
+    promote_ml = (
+        (not getattr(args, "disable_unsupervised_promotions", False))
+        and getattr(args, "enable_isolation_forest", False)
+    )
+    promoted = (~rule_problem) & isof_top & changed_enough & weak_signature & promote_ml
+
+    fm["UNSUPERVISED_PROMOTED_FLAG"] = promoted.astype(int)
+    fm.loc[promoted, "PRIMARY_ANOMALY_CLUSTER"] = "UNSUPERVISED_OUTLIER_WITH_SIGNATURE"
+
+    rule_norm = _series_num(fm, "SEED_RULE_SCORE", 0).clip(lower=0, upper=100)
+    ml_norm = _series_num(fm, "UNSUPERVISED_ISOF_PERCENTILE", 0).clip(lower=0, upper=100)
+    day_norm = _series_num(fm, "ABNORMAL_DAYS_PERCENT", 0).clip(lower=0, upper=100)
+    entropy_norm = (100.0 * _series_num(fm, "VALUE_ENTROPY_PROXY", 0) / np.log1p(10)).clip(lower=0, upper=100)
+
+    risk = 0.66 * rule_norm + 0.22 * ml_norm + 0.08 * day_norm + 0.04 * entropy_norm
+    risk += 4.0 * _series_num(fm, "LATEST_SOURCE_INVALID_RANGE_FLAG", 0)
+    risk += 4.0 * _series_num(fm, "FALLBACK_TO_DEFAULT_VALUE_FLAG", 0)
+    risk += 3.0 * _series_num(fm, "SOURCE_SAME_DAY_CONFLICT_FLAG", 0)
+    risk += 3.0 * _series_num(fm, "REAL_BACK_AND_FORTH_FLAG", 0)
+    risk += 3.0 * _series_num(fm, "HIGH_FREQUENCY_DIFFERENT_VALUES_FLAG", 0)
+    risk += 4.0 * promoted.astype(int)
+    risk -= 18.0 * low_risk.astype(int)
+    risk -= 10.0 * hold.astype(int)
+    risk = risk.clip(lower=0, upper=100)
+
+    # Keep low-risk examples low, but not invisible; they are useful for the comparison plots.
+    risk = pd.Series(risk, index=fm.index)
+    risk.loc[low_risk & ~promoted] = risk.loc[low_risk & ~promoted].clip(upper=35)
+    risk.loc[hold & ~promoted] = risk.loc[hold & ~promoted].clip(upper=45)
+
+    fm["ANOMALY_RISK_SCORE"] = risk.round(3)
+    fm["ANOMALY_RISK_PERCENTILE"] = base.percentile_rank(fm["ANOMALY_RISK_SCORE"])
+    fm["ANOMALY_RISK_BAND"] = fm["ANOMALY_RISK_SCORE"].map(_severity_band_from_risk)
+    fm["LOW_RISK_REGULAR_CHANGE_FLAG"] = low_risk.astype(int)
+
+    abnormal_flag = fm["PRIMARY_ANOMALY_CLUSTER"].isin(REPORTABLE_CLUSTERS) | promoted
+    # Do not promote weak latest-day-only observations below the report threshold into the top report by default.
+    fm["ABNORMAL_FEATURE_FLAG"] = abnormal_flag.astype(int)
+    fm.loc[promoted, "IS_REPORTABLE_PROBLEM"] = 1
+    fm.loc[promoted, "NEEDS_MANUAL_REVIEW"] = 1
+    fm.loc[promoted, "FINAL_TRAINING_LABEL"] = "UNSUPERVISED_OUTLIER_REVIEW"
+    fm.loc[promoted, "TRAINING_WEIGHT"] = np.maximum(_series_num(fm, "TRAINING_WEIGHT", 0).loc[promoted], 0.25)
+
+    fm["MODEL_SIGNATURE_AGREEMENT"] = "LOW_RISK_OR_HOLD"
+    fm.loc[rule_problem & isof_top, "MODEL_SIGNATURE_AGREEMENT"] = "RULE_AND_ISOF"
+    fm.loc[rule_problem & ~isof_top, "MODEL_SIGNATURE_AGREEMENT"] = "RULE_SIGNATURE"
+    fm.loc[promoted, "MODEL_SIGNATURE_AGREEMENT"] = "ISOF_PROMOTED_FOR_REVIEW"
+    fm.loc[(~rule_problem) & isof_top & ~promoted, "MODEL_SIGNATURE_AGREEMENT"] = "ISOF_ONLY_NOT_PROMOTED"
+
+    fm["SOURCE_FEATURE_EVIDENCE_SUMMARY_V71"] = (
+        fm["PRIMARY_ABNORMAL_FEATURE"].astype(str)
+        + " | cluster="
+        + fm["PRIMARY_ANOMALY_CLUSTER"].astype(str)
+        + " | abnormal="
+        + fm["ABNORMAL_DAYS_PRESENTABLE"].astype(str)
+        + " | amount="
+        + fm["ABNORMAL_AMOUNT_PRESENTABLE"].astype(str)
+        + " | rule_score="
+        + _series_num(fm, "SEED_RULE_SCORE", 0).round(1).astype(str)
+        + " | isof_pct="
+        + _series_num(fm, "UNSUPERVISED_ISOF_PERCENTILE", 0).round(1).astype(str)
+        + " | risk="
+        + fm["ANOMALY_RISK_SCORE"].round(1).astype(str)
+    )
+    return fm
+
+
+# ---------------------------------------------------------------------------
+# Dataset and ECGI summary overrides
+# ---------------------------------------------------------------------------
+
+
+def build_training_dataset(
+    candidates: pd.DataFrame,
+    hist: pd.DataFrame,
+    changes: pd.DataFrame,
+    conflicts: pd.DataFrame,
+    rules: Dict[str, Dict[str, Any]],
+    analysis_info: Dict[str, Any],
+    args: argparse.Namespace,
+) -> pd.DataFrame:
+    base.header("PHASE 1D/E/F - CREATE V7.1 HYBRID SIGNATURE + UNSUPERVISED DATASET")
+    if hist.empty:
+        raise RuntimeError("No source history metrics were produced for candidate ECGIs.")
+    candidate_date = pd.to_datetime(analysis_info["candidate_date"]).normalize()
+    change_stats = base.build_change_stats(changes, candidate_date, int(analysis_info.get("latest_db_mismatch_candidate_ecgis", 0) or 0))
+    conflict_stats = base.build_conflict_stats(conflicts)
+
+    fm = hist.copy()
+    if not change_stats.empty:
+        fm = fm.merge(change_stats, on=["ECGI", "FEATURE"], how="left")
+    if not conflict_stats.empty:
+        fm = fm.merge(conflict_stats, on=["ECGI", "FEATURE"], how="left")
+
+    cand_cols = ["ECGI", "LATEST_DB_MISMATCH_RAW_ROWS", "LATEST_CANDIDATE_DATE"]
+    for m in base.META_COLS + base.CANDIDATE_CONTEXT_COLS:
+        mm = base.clean_col_name(m)
+        if mm in candidates.columns and mm not in fm.columns and mm not in cand_cols:
+            cand_cols.append(mm)
+    fm = fm.merge(candidates[[c for c in cand_cols if c in candidates.columns]], on="ECGI", how="left")
+    fm["ECGI_LABEL"] = fm["ECGI"].map(base.excel_safe_ecgi)
+    fm["ANALYSIS_DAYS"] = int(analysis_info.get("requested_days", args.days))
+    fm["ANALYSIS_START_DATE"] = analysis_info["window_start_date"]
+    fm["ANALYSIS_END_DATE"] = analysis_info["window_end_date"]
+
+    fm = base.add_seed_labels(fm, rules, analysis_info, args)
+    fm = base.attach_reference_compatibility(fm, rules, args)
+    fm = add_v71_engineered_features(fm)
+    fm = add_isolation_forest_scores(fm, args)
+    fm = apply_v71_anomaly_fusion(fm, args)
+
+    base.log(f"V7.1 feature rows with labels/clusters: {len(fm):,}", indent=1)
+    base.log(f"Primary anomaly cluster distribution: {fm['PRIMARY_ANOMALY_CLUSTER'].value_counts().head(20).to_dict()}", indent=1)
+    base.log(f"Rows marked reportable/abnormal: {int(fm['ABNORMAL_FEATURE_FLAG'].sum()):,}", indent=1)
+    return fm.sort_values(["ABNORMAL_FEATURE_FLAG", "ANOMALY_RISK_SCORE"], ascending=[False, False]).reset_index(drop=True)
+
+
+def _join_top_feature_briefs(d: pd.DataFrame, n: int = 8) -> str:
+    parts = []
+    for r in d.sort_values("ANOMALY_RISK_SCORE", ascending=False).head(n).itertuples(index=False):
+        feature = getattr(r, "PRIMARY_ABNORMAL_FEATURE", getattr(r, "FEATURE", ""))
+        cluster = getattr(r, "PRIMARY_ANOMALY_CLUSTER", "")
+        days = getattr(r, "ABNORMAL_DAYS_PRESENTABLE", "")
+        amount = getattr(r, "ABNORMAL_AMOUNT_PRESENTABLE", "")
+        risk = _safe_float(getattr(r, "ANOMALY_RISK_SCORE", 0))
+        parts.append(f"{feature} [{cluster}] {days}, {amount}, risk={risk:.1f}")
+    return "; ".join(parts)
+
+
+def build_ecgi_summary(dataset: pd.DataFrame, min_report_score: float) -> pd.DataFrame:
+    base.header("PHASE 1G - BUILD V7.1 ECGI INCIDENT SUMMARY BY CLUSTER")
+    if dataset.empty:
+        return pd.DataFrame()
+
+    risk_col = "ANOMALY_RISK_SCORE" if "ANOMALY_RISK_SCORE" in dataset.columns else "SEED_RULE_SCORE"
+    abnormal_col = "ABNORMAL_FEATURE_FLAG" if "ABNORMAL_FEATURE_FLAG" in dataset.columns else "IS_REPORTABLE_PROBLEM"
+    reportable = dataset[(dataset[abnormal_col] == 1) & (dataset[risk_col] >= float(min_report_score))].copy()
+    if reportable.empty:
+        base.log("No reportable ECGI incidents after V7.1 cluster/risk threshold.", indent=1)
+        return pd.DataFrame()
+
+    reportable = reportable.sort_values(["ECGI", risk_col], ascending=[True, False])
+    top = reportable.groupby("ECGI", as_index=False).head(1).copy()
+    top = top.rename(
+        columns={
+            "PRIMARY_ABNORMAL_FEATURE": "MAIN_PROBLEM_FEATURE",
+            "PRIMARY_ANOMALY_CLUSTER": "PRIMARY_PROBLEM_CLASS",
+            "SOURCE_FEATURE_EVIDENCE_SUMMARY_V71": "MAIN_EVIDENCE_SUMMARY",
+            risk_col: "MAIN_FEATURE_SEVERITY_SCORE",
+            "SOURCE_CHANGE_DAYS_COUNT": "MAIN_FEATURE_CHANGED_DAYS_COUNT",
+            "SOURCE_CHANGED_DAYS_PERCENT": "MAIN_FEATURE_CHANGED_DAYS_PERCENT",
+            "SOURCE_FIRST_CHANGE_DATE": "MAIN_FEATURE_FIRST_CHANGE_DATE",
+            "SOURCE_LAST_CHANGE_DATE": "MAIN_FEATURE_LAST_CHANGE_DATE",
+            "SOURCE_LATEST_CHANGE": "MAIN_FEATURE_LATEST_CHANGE",
+        }
+    )
+
+    # Ensure needed numeric columns exist before aggregation.
+    for c in [
+        "ABNORMAL_DAYS_COUNT",
+        "ABNORMAL_AMOUNT_NUMERIC",
+        "SOURCE_CHANGE_COUNT",
+        "SOURCE_CHANGE_DAYS_COUNT",
+        "UNSUPERVISED_ISOF_TOP_FLAG",
+        "UNSUPERVISED_PROMOTED_FLAG",
+        "LOW_RISK_REGULAR_CHANGE_FLAG",
+        "FALLBACK_TO_DEFAULT_VALUE_FLAG",
+        "AUDIT_PUSH_NOT_APPLIED_FLAG",
+        "LATEST_SOURCE_INVALID_RANGE_FLAG",
+        "REAL_BACK_AND_FORTH_FLAG",
+        "HIGH_FREQUENCY_DIFFERENT_VALUES_FLAG",
+        "SOURCE_SAME_DAY_CONFLICT_FLAG",
+        "PERSISTENT_SOURCE_INSTABILITY_FLAG",
+    ]:
+        if c not in reportable.columns:
+            reportable[c] = 0
+        reportable[c] = base.safe_numeric(reportable[c])
+
+    agg = reportable.groupby("ECGI", as_index=False).agg(
+        REPORTABLE_FEATURE_INCIDENT_COUNT=("FEATURE", "size"),
+        ABNORMAL_FEATURE_COUNT=("PRIMARY_ABNORMAL_FEATURE", "nunique"),
+        ABNORMAL_DAYS_TOTAL=("ABNORMAL_DAYS_COUNT", "sum"),
+        ABNORMAL_DAYS_MAX=("ABNORMAL_DAYS_COUNT", "max"),
+        TOTAL_SOURCE_CHANGE_EVENTS=("SOURCE_CHANGE_COUNT", "sum"),
+        TOTAL_SOURCE_CHANGE_DAYS_ACROSS_FEATURES=("SOURCE_CHANGE_DAYS_COUNT", "sum"),
+        ABNORMAL_AMOUNT_NUMERIC_MAX=("ABNORMAL_AMOUNT_NUMERIC", "max"),
+        UNSUPERVISED_TOP_FEATURE_COUNT=("UNSUPERVISED_ISOF_TOP_FLAG", "sum"),
+        UNSUPERVISED_PROMOTED_FEATURE_COUNT=("UNSUPERVISED_PROMOTED_FLAG", "sum"),
+        LOW_RISK_REGULAR_CHANGE_FEATURE_COUNT=("LOW_RISK_REGULAR_CHANGE_FLAG", "sum"),
+        FALLBACK_TO_DEFAULT_FEATURE_COUNT=("FALLBACK_TO_DEFAULT_VALUE_FLAG", "sum"),
+        AUDIT_PUSH_NOT_APPLIED_FEATURE_COUNT=("AUDIT_PUSH_NOT_APPLIED_FLAG", "sum"),
+        INVALID_LATEST_SOURCE_VALUE_FEATURE_COUNT=("LATEST_SOURCE_INVALID_RANGE_FLAG", "sum"),
+        REAL_BACK_AND_FORTH_FEATURE_COUNT=("REAL_BACK_AND_FORTH_FLAG", "sum"),
+        HIGH_FREQUENCY_DIFFERENT_VALUES_FEATURE_COUNT=("HIGH_FREQUENCY_DIFFERENT_VALUES_FLAG", "sum"),
+        SAME_DAY_CONFLICT_FEATURE_COUNT=("SOURCE_SAME_DAY_CONFLICT_FLAG", "sum"),
+        PERSISTENT_SOURCE_INSTABILITY_FEATURE_COUNT=("PERSISTENT_SOURCE_INSTABILITY_FLAG", "sum"),
+        SOURCE_RULE_SCORE_FROM_FEATURES=("SEED_RULE_SCORE", "sum"),
+        MAX_FEATURE_SEVERITY_SCORE=(risk_col, "max"),
+        AVG_FEATURE_RISK_SCORE=(risk_col, "mean"),
+    )
+
+    top_feats = (
+        reportable.sort_values(["ECGI", risk_col], ascending=[True, False])
+        .groupby("ECGI", group_keys=False)
+        .apply(lambda d: _join_top_feature_briefs(d, n=8))
+        .rename("TOP_FEATURE_INCIDENTS")
+        .reset_index()
+    )
+
+    cluster_count_rows = (
+        reportable.groupby(["ECGI", "PRIMARY_ANOMALY_CLUSTER"], as_index=False)
+        .size()
+        .sort_values(["ECGI", "size"], ascending=[True, False])
+    )
+    cluster_counts = (
+        cluster_count_rows.groupby("ECGI")
+        .apply(lambda d: "; ".join(f"{row['PRIMARY_ANOMALY_CLUSTER']}:{int(row['size'])}" for _, row in d.iterrows()))
+        .rename("CLUSTER_INCIDENT_COUNTS")
+        .reset_index()
+    )
+
+    keep_cols = [
+        "ECGI",
+        "ECGI_LABEL",
+        "REGION",
+        "MARKETCLUSTER",
+        "MARKET",
+        "SUBMARKET",
+        "SERVER_ID",
+        "ANALYSIS_DAYS",
+        "ANALYSIS_START_DATE",
+        "ANALYSIS_END_DATE",
+        "LATEST_DB_MISMATCH_RAW_ROWS",
+        "LATEST_CANDIDATE_DATE",
+        "PRIMARY_PROBLEM_CLASS",
+        "MAIN_PROBLEM_FEATURE",
+        "MAIN_FEATURE_SEVERITY_SCORE",
+        "MAIN_FEATURE_CHANGED_DAYS_COUNT",
+        "MAIN_FEATURE_CHANGED_DAYS_PERCENT",
+        "MAIN_FEATURE_FIRST_CHANGE_DATE",
+        "MAIN_FEATURE_LAST_CHANGE_DATE",
+        "MAIN_FEATURE_LATEST_CHANGE",
+        "MAIN_EVIDENCE_SUMMARY",
+        "ABNORMAL_DAYS_PRESENTABLE",
+        "ABNORMAL_AMOUNT_PRESENTABLE",
+        "MODEL_SIGNATURE_AGREEMENT",
+        "UNSUPERVISED_ISOF_PERCENTILE",
+        "LATEST_SOURCE_VALUE",
+        "PREVIOUS_NONLATEST_SOURCE_VALUE",
+        "FIRST_SOURCE_VALUE",
+        "LATEST_DB_VALUE",
+        "ANOMALY_RISK_BAND",
+        "RECOMMENDED_ACTION",
+    ]
+    top_reduced = top[[c for c in keep_cols if c in top.columns]].copy()
+
+    ecgi = agg.merge(top_reduced, on="ECGI", how="left").merge(top_feats, on="ECGI", how="left").merge(cluster_counts, on="ECGI", how="left")
+    ecgi["PRIMARY_ANOMALY_CLUSTER"] = ecgi["PRIMARY_PROBLEM_CLASS"]
+    ecgi["PRIMARY_ABNORMAL_FEATURE"] = ecgi["MAIN_PROBLEM_FEATURE"]
+
+    risk = (
+        ecgi["MAX_FEATURE_SEVERITY_SCORE"].fillna(0)
+        + 2.0 * np.sqrt(ecgi["ABNORMAL_FEATURE_COUNT"].fillna(0).clip(lower=0))
+        + 0.25 * ecgi["ABNORMAL_DAYS_MAX"].fillna(0).clip(lower=0)
+        + 1.5 * (ecgi["UNSUPERVISED_PROMOTED_FEATURE_COUNT"].fillna(0) > 0).astype(int)
+    )
+    ecgi["ECGI_ANOMALY_RISK_SCORE"] = risk.clip(0, 100).round(3)
+    ecgi["SOURCE_RULE_SCORE"] = ecgi["ECGI_ANOMALY_RISK_SCORE"]
+    ecgi["SOURCE_RULE_PERCENTILE"] = base.percentile_rank(ecgi["SOURCE_RULE_SCORE"])
+    ecgi["ABNORMAL_DAYS_AND_AMOUNTS"] = (
+        ecgi["ABNORMAL_DAYS_TOTAL"].round(0).astype(int).astype(str)
+        + " abnormal feature-days; max "
+        + ecgi["ABNORMAL_DAYS_MAX"].round(0).astype(int).astype(str)
+        + " days on "
+        + ecgi["PRIMARY_ABNORMAL_FEATURE"].fillna("").astype(str)
+        + "; amount="
+        + ecgi.get("ABNORMAL_AMOUNT_PRESENTABLE", pd.Series("", index=ecgi.index)).fillna("").astype(str)
+    )
+    ecgi["PLAIN_ENGLISH_SUMMARY"] = ecgi.apply(
+        lambda r: (
+            f"{r.get('ECGI_LABEL','')} has primary_anomaly_cluster={r.get('PRIMARY_ANOMALY_CLUSTER','')} "
+            f"on primary_abnormal_feature={r.get('PRIMARY_ABNORMAL_FEATURE','')}. "
+            f"It has {int(r.get('ABNORMAL_FEATURE_COUNT',0))} abnormal feature(s), "
+            f"{int(r.get('ABNORMAL_DAYS_TOTAL',0))} abnormal feature-day(s), "
+            f"risk={float(r.get('ECGI_ANOMALY_RISK_SCORE',0)):.1f}."
+        ),
+        axis=1,
+    )
+
+    ecgi = ecgi.sort_values("ECGI_ANOMALY_RISK_SCORE", ascending=False).reset_index(drop=True)
+    ecgi.insert(0, "INCIDENT_RANK", np.arange(1, len(ecgi) + 1))
+    base.log(f"V7.1 reportable ECGI incidents: {len(ecgi):,}", indent=1)
+    return ecgi
+
+
+# ---------------------------------------------------------------------------
+# V7.1 reports
+# ---------------------------------------------------------------------------
+
+
+def _md_escape(x: Any) -> str:
+    s = "" if pd.isna(x) else str(x)
+    s = s.replace("|", "\\|").replace("\n", " ")
+    return s
+
+
+def _md_table(df: pd.DataFrame, cols: List[Tuple[str, str]], max_rows: Optional[int] = None) -> List[str]:
+    if df.empty:
+        return ["_No rows._", ""]
+    d = df.copy()
+    if max_rows is not None:
+        d = d.head(max_rows)
+    headers = [h for _, h in cols]
+    lines = ["| " + " | ".join(headers) + " |", "| " + " | ".join(["---"] * len(headers)) + " |"]
+    for _, r in d.iterrows():
+        vals = [_md_escape(r.get(c, "")) for c, _ in cols]
+        lines.append("| " + " | ".join(vals) + " |")
+    lines.append("")
+    return lines
+
+
+def write_v71_final_report(out_dir: Path, analysis_info: Dict[str, Any], args: argparse.Namespace, ecgi_summary: pd.DataFrame, dataset: pd.DataFrame) -> None:
+    top_n = int(getattr(args, "final_report_top_n", 100))
+    cluster_n = int(getattr(args, "cluster_report_top_n", 30))
+    report_path = out_dir / "cesmlc_v71_final_report_top100_by_cluster.md"
+    csv_path = out_dir / "cesmlc_v71_final_report_top100.csv"
+
+    lines: List[str] = []
+    lines.append("# CESMLC V7.1 Final Anomaly Report")
+    lines.append("")
+    lines.append(f"- **Script version**: `{SCRIPT_VERSION}`")
+    lines.append(f"- **Input**: `{analysis_info.get('input_file','')}`")
+    lines.append(f"- **Window**: `{analysis_info.get('window_start_date','')}` to `{analysis_info.get('window_end_date','')}`")
+    lines.append(f"- **Candidate date**: `{analysis_info.get('candidate_date','')}`")
+    lines.append(f"- **Candidate ECGIs**: `{analysis_info.get('latest_db_mismatch_candidate_ecgis','')}`")
+    lines.append(f"- **Report threshold**: `{getattr(args, 'min_report_score', '')}`")
+    lines.append("")
+
+    if ecgi_summary.empty:
+        lines.append("No ECGI incidents passed the V7.1 report threshold.")
+        report_path.write_text("\n".join(lines), encoding="utf-8")
+        pd.DataFrame().to_csv(csv_path, index=False)
+        return
+
+    top100 = ecgi_summary.head(top_n).copy()
+    top100.to_csv(csv_path, index=False)
+
+    lines.append("## Executive cluster summary")
+    lines.append("")
+    cluster_summary = (
+        ecgi_summary.groupby("PRIMARY_ANOMALY_CLUSTER", dropna=False)
+        .agg(
+            ECGI_COUNT=("ECGI", "nunique"),
+            AVG_RISK=("ECGI_ANOMALY_RISK_SCORE", "mean"),
+            MAX_RISK=("ECGI_ANOMALY_RISK_SCORE", "max"),
+            ABNORMAL_FEATURES=("ABNORMAL_FEATURE_COUNT", "sum"),
+            ABNORMAL_DAYS=("ABNORMAL_DAYS_TOTAL", "sum"),
+        )
+        .reset_index()
+        .sort_values(["MAX_RISK", "ECGI_COUNT"], ascending=False)
+    )
+    cluster_summary["AVG_RISK"] = cluster_summary["AVG_RISK"].round(1)
+    cluster_summary["MAX_RISK"] = cluster_summary["MAX_RISK"].round(1)
+    lines += _md_table(
+        cluster_summary,
+        [
+            ("PRIMARY_ANOMALY_CLUSTER", "primary_anomaly_cluster"),
+            ("ECGI_COUNT", "ECGIs"),
+            ("ABNORMAL_FEATURES", "abnormal features"),
+            ("ABNORMAL_DAYS", "abnormal feature-days"),
+            ("AVG_RISK", "avg risk"),
+            ("MAX_RISK", "max risk"),
+        ],
+    )
+
+    lines.append(f"## Top {top_n} overall")
+    lines.append("")
+    display = top100.copy()
+    display["risk"] = display["ECGI_ANOMALY_RISK_SCORE"].round(1)
+    lines += _md_table(
+        display,
+        [
+            ("INCIDENT_RANK", "rank"),
+            ("ECGI_LABEL", "ECGI"),
+            ("PRIMARY_ANOMALY_CLUSTER", "primary_anomaly_cluster"),
+            ("PRIMARY_ABNORMAL_FEATURE", "primary_abnormal_feature"),
+            ("risk", "risk"),
+            ("ABNORMAL_DAYS_AND_AMOUNTS", "abnormal days / amounts"),
+            ("MODEL_SIGNATURE_AGREEMENT", "model agreement"),
+            ("SERVER_ID", "server"),
+            ("MARKET", "market"),
+        ],
+        max_rows=top_n,
+    )
+
+    cluster_order = cluster_summary["PRIMARY_ANOMALY_CLUSTER"].tolist()
+    for cluster in cluster_order:
+        cdf = ecgi_summary[ecgi_summary["PRIMARY_ANOMALY_CLUSTER"].fillna("") == cluster].sort_values("ECGI_ANOMALY_RISK_SCORE", ascending=False)
+        if cdf.empty:
+            continue
+        lines.append(f"## Top {cluster_n} for primary_anomaly_cluster = `{cluster}`")
+        lines.append("")
+        feature_summary = (
+            cdf.groupby("PRIMARY_ABNORMAL_FEATURE", dropna=False)
+            .agg(ECGI_COUNT=("ECGI", "nunique"), MAX_RISK=("ECGI_ANOMALY_RISK_SCORE", "max"), ABNORMAL_DAYS=("ABNORMAL_DAYS_TOTAL", "sum"))
+            .reset_index()
+            .sort_values(["MAX_RISK", "ECGI_COUNT"], ascending=False)
+        )
+        feature_summary["MAX_RISK"] = feature_summary["MAX_RISK"].round(1)
+        lines.append("**Grouped by primary_abnormal_feature:**")
+        lines.append("")
+        lines += _md_table(
+            feature_summary.head(12),
+            [
+                ("PRIMARY_ABNORMAL_FEATURE", "primary_abnormal_feature"),
+                ("ECGI_COUNT", "ECGIs"),
+                ("ABNORMAL_DAYS", "abnormal feature-days"),
+                ("MAX_RISK", "max risk"),
+            ],
+        )
+        lines += _md_table(
+            cdf.assign(risk=cdf["ECGI_ANOMALY_RISK_SCORE"].round(1)),
+            [
+                ("INCIDENT_RANK", "overall rank"),
+                ("ECGI_LABEL", "ECGI"),
+                ("PRIMARY_ABNORMAL_FEATURE", "primary_abnormal_feature"),
+                ("risk", "risk"),
+                ("ABNORMAL_DAYS_AND_AMOUNTS", "abnormal days / amounts"),
+                ("TOP_FEATURE_INCIDENTS", "top feature incidents"),
+                ("RECOMMENDED_ACTION", "recommended action"),
+            ],
+            max_rows=cluster_n,
+        )
+
+    report_path.write_text("\n".join(lines), encoding="utf-8")
+    base.log(f"Wrote V7.1 final markdown report: {report_path}", indent=1)
+
+
+def write_manual_markdown(out_dir: Path, ecgi_summary: pd.DataFrame, dataset: pd.DataFrame, top_n: int) -> None:
+    # Preserve the old filename, but write the better V7.1 report content.
+    class ArgsLite:
+        final_report_top_n = max(100, int(top_n))
+        cluster_report_top_n = 30
+        min_report_score = 0
+
+    analysis_info = {}
+    write_v71_final_report(out_dir, analysis_info, ArgsLite(), ecgi_summary, dataset)
+    src = out_dir / "cesmlc_v71_final_report_top100_by_cluster.md"
+    text = src.read_text(encoding="utf-8") if src.exists() else "# CESMLC V7.1 Report\n"
+    (out_dir / "cesmlc_v7_top_manual_review_report.md").write_text(text, encoding="utf-8")
+    (out_dir / "cesmlc_v6_top_manual_review_report.md").write_text(text, encoding="utf-8")
+
+
+# ---------------------------------------------------------------------------
+# Daily history query and plots
+# ---------------------------------------------------------------------------
+
+
+def _selected_pairs_for_stories(dataset: pd.DataFrame, story_count: int) -> Tuple[List[Dict[str, Any]], List[Tuple[str, str]]]:
+    if dataset.empty:
+        return [], []
+    d = dataset.copy()
+    for c in ["ABNORMAL_FEATURE_FLAG", "LOW_RISK_REGULAR_CHANGE_FLAG", "SOURCE_CHANGE_COUNT", "ANOMALY_RISK_SCORE"]:
+        if c not in d.columns:
+            d[c] = 0
+        d[c] = base.safe_numeric(d[c])
+
+    abnormal_pool = d[(d["ABNORMAL_FEATURE_FLAG"] == 1) & (d["SOURCE_CHANGE_COUNT"] > 0)].sort_values("ANOMALY_RISK_SCORE", ascending=False)
+    if abnormal_pool.empty:
+        abnormal_pool = d[d["ABNORMAL_FEATURE_FLAG"] == 1].sort_values("ANOMALY_RISK_SCORE", ascending=False)
+    low_pool_all = d[(d["ABNORMAL_FEATURE_FLAG"] == 0) & (d["SOURCE_CHANGE_COUNT"] > 0)].copy()
+    if low_pool_all.empty:
+        low_pool_all = d[d["ABNORMAL_FEATURE_FLAG"] == 0].copy()
+    low_pool_all = low_pool_all.sort_values("ANOMALY_RISK_SCORE", ascending=True)
+
+    stories: List[Dict[str, Any]] = []
+    pairs: List[Tuple[str, str]] = []
+    used_abnormal: set = set()
+    used_low: set = set()
+
+    for _, ar in abnormal_pool.iterrows():
+        if len(stories) >= story_count:
+            break
+        akey = (str(ar.get("ECGI", "")), str(ar.get("FEATURE", "")))
+        if akey in used_abnormal:
+            continue
+        same_feature = low_pool_all[(low_pool_all["FEATURE"] == ar.get("FEATURE")) & (low_pool_all["ECGI"] != ar.get("ECGI"))]
+        if same_feature.empty:
+            same_feature = low_pool_all[low_pool_all["ECGI"] != ar.get("ECGI")]
+        if same_feature.empty:
+            continue
+        lr = same_feature.iloc[0]
+        lkey = (str(lr.get("ECGI", "")), str(lr.get("FEATURE", "")))
+        used_abnormal.add(akey)
+        used_low.add(lkey)
+        stories.append({"abnormal": ar.to_dict(), "low_risk": lr.to_dict()})
+        pairs.append(akey)
+        pairs.append(lkey)
+
+    # Multi-feature ECGI story pairs: top ECGIs with several abnormal features.
+    top_ecgis = (
+        d[d["ABNORMAL_FEATURE_FLAG"] == 1]
+        .sort_values("ANOMALY_RISK_SCORE", ascending=False)
+        .groupby("ECGI")
+        .head(3)
+        .groupby("ECGI")
+        .filter(lambda x: len(x) >= 2)
+        .groupby("ECGI")
+        .head(3)
+    )
+    for _, r in top_ecgis.head(max(0, story_count * 3)).iterrows():
+        pairs.append((str(r.get("ECGI", "")), str(r.get("FEATURE", ""))))
+
+    pairs = [(e, f) for e, f in pairs if e and f]
+    pairs = list(dict.fromkeys(pairs))
+    return stories, pairs
+
+
+def _query_daily_history_for_pairs(
+    input_path: Path,
+    analysis_info: Dict[str, Any],
+    args: argparse.Namespace,
+    pairs: List[Tuple[str, str]],
+) -> pd.DataFrame:
+    if not pairs:
+        return pd.DataFrame(columns=["LOAD_DATE", "ECGI", "FEATURE", "SOURCE_VALUE"])
+    header_cols, colmap = base.read_header(input_path)
+    date_col = base.first_existing(header_cols, base.DATE_CANDIDATES)
+    if not date_col:
+        return pd.DataFrame(columns=["LOAD_DATE", "ECGI", "FEATURE", "SOURCE_VALUE"])
+    selected_features = _clean_feature_list([f for _, f in pairs])
+    selected_features = [f for f in selected_features if f in colmap]
+    selected_ecgis = sorted({base.normalize_key_value(e) for e, _ in pairs if base.normalize_key_value(e)})
+    if not selected_features or not selected_ecgis:
+        return pd.DataFrame(columns=["LOAD_DATE", "ECGI", "FEATURE", "SOURCE_VALUE"])
+
+    con = base.open_duckdb(
+        None,
+        int(getattr(args, "threads", 1)),
+        getattr(args, "memory_limit", "6GB"),
+        duckdb_temp_dir=Path(getattr(args, "duckdb_temp_dir", "")) if getattr(args, "duckdb_temp_dir", None) else None,
+    )
+    try:
+        file_sql = base.sql_path(input_path)
+        date_expr = base.date_parse_expr(colmap[date_col])
+        ecgi_sql = base.ecgi_expr_from_columns(colmap)
+        feature_selects = [f"{base.feature_norm_expr(colmap[f], f, int(getattr(args, 'latlon_decimals', 5)))} AS {base.quote_ident(f)}" for f in selected_features]
+        ecgi_list_sql = ", ".join(base.sql_string(e) for e in selected_ecgis)
+        raw_select = ",\n                ".join([f"{date_expr} AS LOAD_DATE", f"{ecgi_sql} AS ECGI", *feature_selects])
+        union_parts = []
+        for f in selected_features:
+            fq = base.quote_ident(f)
+            union_parts.append(f"SELECT LOAD_DATE, ECGI, {base.sql_string(f)} AS FEATURE, {fq} AS SOURCE_VALUE FROM filtered WHERE {fq} IS NOT NULL")
+        sql = f"""
+        WITH raw AS (
+            SELECT
+                {raw_select}
+            FROM read_csv_auto({file_sql}, HEADER=TRUE, ALL_VARCHAR=TRUE, SAMPLE_SIZE=100000, IGNORE_ERRORS=TRUE)
+        ), filtered AS (
+            SELECT *
+            FROM raw
+            WHERE LOAD_DATE BETWEEN DATE {base.sql_string(str(analysis_info.get('window_start_date')))} AND DATE {base.sql_string(str(analysis_info.get('window_end_date')))}
+              AND ECGI IN ({ecgi_list_sql})
+        )
+        {" UNION ALL ".join(union_parts)}
+        """
+        hist = con.execute(sql).fetchdf()
+    finally:
+        try:
+            con.close()
+        except Exception:
+            pass
+    if hist.empty:
+        return hist
+    hist.columns = [base.clean_col_name(c) for c in hist.columns]
+    hist["LOAD_DATE"] = pd.to_datetime(hist["LOAD_DATE"], errors="coerce")
+    hist["ECGI"] = hist["ECGI"].map(base.normalize_key_value)
+    hist["FEATURE"] = hist["FEATURE"].map(base.clean_col_name)
+    hist["SOURCE_VALUE"] = hist["SOURCE_VALUE"].map(base.normalize_value_text)
+    return hist.sort_values(["FEATURE", "ECGI", "LOAD_DATE"]).reset_index(drop=True)
+
+
+def _plot_value_series(ax: Any, df: pd.DataFrame, label_col: str, title: str) -> None:
+    # Common categorical mapping when the values are not mostly numeric.
+    values = df["SOURCE_VALUE"].astype(str)
+    nums = pd.to_numeric(values, errors="coerce")
+    numeric = nums.notna().mean() >= 0.80 if len(nums) else False
+    if numeric:
+        df = df.copy()
+        df["Y"] = nums
+        for label, g in df.groupby(label_col):
+            ax.step(g["LOAD_DATE"], g["Y"], where="post", marker="o", label=str(label))
+        ax.set_ylabel("source value")
+    else:
+        cats = list(dict.fromkeys(values.tolist()))
+        cat_map = {v: i for i, v in enumerate(cats)}
+        df = df.copy()
+        df["Y"] = df["SOURCE_VALUE"].map(cat_map)
+        for label, g in df.groupby(label_col):
+            ax.step(g["LOAD_DATE"], g["Y"], where="post", marker="o", label=str(label))
+        ax.set_yticks(list(cat_map.values()))
+        ax.set_yticklabels([_short(k, 40) for k in cat_map.keys()])
+        ax.set_ylabel("categorical value")
+    ax.set_title(title)
+    ax.grid(True, alpha=0.25)
+    ax.legend(fontsize=8)
+
+
+def _plot_story_comparison(story: Dict[str, Any], hist: pd.DataFrame, out_file: Path) -> bool:
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    ar = story["abnormal"]
+    lr = story["low_risk"]
+    a_ecgi = base.normalize_key_value(ar.get("ECGI", ""))
+    l_ecgi = base.normalize_key_value(lr.get("ECGI", ""))
+    a_feature = base.clean_col_name(ar.get("FEATURE", ""))
+    l_feature = base.clean_col_name(lr.get("FEATURE", ""))
+    if a_feature != l_feature:
+        # The strongest story is same-feature. If unavailable, still plot side-by-side in one chart label.
+        feature_filter = [a_feature, l_feature]
+    else:
+        feature_filter = [a_feature]
+    sub = hist[(hist["ECGI"].isin([a_ecgi, l_ecgi])) & (hist["FEATURE"].isin(feature_filter))].copy()
+    if sub.empty:
+        return False
+    sub["SERIES"] = sub.apply(lambda r: f"{'abnormal' if r.ECGI == a_ecgi else 'low-risk'} | {r.ECGI} | {r.FEATURE}", axis=1)
+
+    fig, ax = plt.subplots(figsize=(13, 6))
+    title = (
+        f"V7.1 comparison story: abnormal vs regular low-risk change\n"
+        f"Abnormal: {_short(ar.get('ECGI_LABEL', a_ecgi), 35)} / {a_feature} / {ar.get('PRIMARY_ANOMALY_CLUSTER','')} / risk={_safe_float(ar.get('ANOMALY_RISK_SCORE',0)):.1f}   "
+        f"Low-risk: {_short(lr.get('ECGI_LABEL', l_ecgi), 35)} / {l_feature} / {lr.get('PRIMARY_ANOMALY_CLUSTER','')} / risk={_safe_float(lr.get('ANOMALY_RISK_SCORE',0)):.1f}"
+    )
+    _plot_value_series(ax, sub, "SERIES", title)
+    fig.autofmt_xdate()
+    fig.tight_layout()
+    fig.savefig(out_file, dpi=160, bbox_inches="tight")
+    plt.close(fig)
+    return True
+
+
+def _plot_multifeature_ecgi(ecgi: str, rows: pd.DataFrame, hist: pd.DataFrame, out_file: Path) -> bool:
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    features = rows.sort_values("ANOMALY_RISK_SCORE", ascending=False)["FEATURE"].drop_duplicates().head(3).tolist()
+    sub = hist[(hist["ECGI"] == base.normalize_key_value(ecgi)) & (hist["FEATURE"].isin(features))].copy()
+    if sub.empty:
+        return False
+    fig, axes = plt.subplots(len(features), 1, figsize=(13, 3.4 * len(features)), sharex=True)
+    if len(features) == 1:
+        axes = [axes]
+    for ax, feature in zip(axes, features):
+        g = sub[sub["FEATURE"] == feature].copy()
+        meta = rows[rows["FEATURE"] == feature].sort_values("ANOMALY_RISK_SCORE", ascending=False).head(1)
+        cluster = meta["PRIMARY_ANOMALY_CLUSTER"].iloc[0] if not meta.empty and "PRIMARY_ANOMALY_CLUSTER" in meta else ""
+        risk = _safe_float(meta["ANOMALY_RISK_SCORE"].iloc[0]) if not meta.empty and "ANOMALY_RISK_SCORE" in meta else 0
+        g["SERIES"] = f"{feature} | {cluster} | risk={risk:.1f}"
+        _plot_value_series(ax, g, "SERIES", f"{ecgi} - {feature}")
+    fig.suptitle(f"V7.1 multi-feature ECGI story: {ecgi}", y=1.02, fontsize=14)
+    fig.autofmt_xdate()
+    fig.tight_layout()
+    fig.savefig(out_file, dpi=160, bbox_inches="tight")
+    plt.close(fig)
+    return True
+
+
+def make_v71_plots(out_dir: Path, analysis_info: Dict[str, Any], args: argparse.Namespace, dataset: pd.DataFrame, ecgi_summary: pd.DataFrame) -> None:
+    if getattr(args, "disable_plots", False):
+        base.log("V7.1 plots disabled by --disable-plots", indent=1)
+        return
+    try:
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except Exception as exc:
+        base.log(f"V7.1 plots skipped because matplotlib is unavailable: {exc}", indent=1)
+        return
+
+    plot_dir = out_dir / "plots_v71"
+    plot_dir.mkdir(parents=True, exist_ok=True)
+    images: List[Tuple[str, str]] = []
+
+    try:
+        # 1) Cluster count chart.
+        if not ecgi_summary.empty and "PRIMARY_ANOMALY_CLUSTER" in ecgi_summary.columns:
+            counts = ecgi_summary["PRIMARY_ANOMALY_CLUSTER"].value_counts().head(15)
+            fig, ax = plt.subplots(figsize=(12, 6))
+            counts.sort_values().plot(kind="barh", ax=ax)
+            ax.set_title("V7.1 reportable ECGIs by primary_anomaly_cluster")
+            ax.set_xlabel("ECGI count")
+            fig.tight_layout()
+            p = plot_dir / "01_cluster_counts.png"
+            fig.savefig(p, dpi=160, bbox_inches="tight")
+            plt.close(fig)
+            images.append(("Cluster counts", str(p.relative_to(out_dir))))
+
+        # 2) Risk versus abnormal days scatter.
+        if not dataset.empty and "ANOMALY_RISK_SCORE" in dataset.columns:
+            d = dataset[dataset.get("ABNORMAL_FEATURE_FLAG", 0) == 1].copy()
+            if not d.empty:
+                fig, ax = plt.subplots(figsize=(11, 6))
+                ax.scatter(d["ABNORMAL_DAYS_COUNT"], d["ANOMALY_RISK_SCORE"], s=np.clip(_series_num(d, "FEATURE_CRITICALITY_WEIGHT", 5) * 5, 10, 80), alpha=0.45)
+                ax.set_title("V7.1 feature incidents: risk score vs abnormal days")
+                ax.set_xlabel("abnormal days in window")
+                ax.set_ylabel("anomaly risk score")
+                ax.grid(True, alpha=0.25)
+                fig.tight_layout()
+                p = plot_dir / "02_risk_vs_abnormal_days.png"
+                fig.savefig(p, dpi=160, bbox_inches="tight")
+                plt.close(fig)
+                images.append(("Risk vs abnormal days", str(p.relative_to(out_dir))))
+
+        # 3) Heatmap of top ECGIs x abnormal features.
+        if not dataset.empty and "ANOMALY_RISK_SCORE" in dataset.columns:
+            top_ecgis = ecgi_summary.head(int(getattr(args, "plot_top_ecgis", 30)))["ECGI"].tolist() if not ecgi_summary.empty else []
+            d = dataset[(dataset["ECGI"].isin(top_ecgis)) & (dataset.get("ABNORMAL_FEATURE_FLAG", 0) == 1)].copy()
+            if not d.empty:
+                top_features = d.groupby("FEATURE")["ANOMALY_RISK_SCORE"].max().sort_values(ascending=False).head(int(getattr(args, "plot_top_features", 14))).index.tolist()
+                mat = d[d["FEATURE"].isin(top_features)].pivot_table(index="ECGI_LABEL", columns="FEATURE", values="ANOMALY_RISK_SCORE", aggfunc="max", fill_value=0)
+                mat = mat.loc[[x for x in ecgi_summary.head(int(getattr(args, "plot_top_ecgis", 30)))["ECGI_LABEL"].tolist() if x in mat.index]]
+                if not mat.empty:
+                    fig, ax = plt.subplots(figsize=(max(10, 0.7 * len(mat.columns)), max(7, 0.35 * len(mat.index))))
+                    im = ax.imshow(mat.values, aspect="auto")
+                    ax.set_xticks(np.arange(len(mat.columns)))
+                    ax.set_xticklabels(mat.columns, rotation=45, ha="right")
+                    ax.set_yticks(np.arange(len(mat.index)))
+                    ax.set_yticklabels([_short(x, 35) for x in mat.index])
+                    ax.set_title("V7.1 severity heatmap: top ECGIs x abnormal features")
+                    fig.colorbar(im, ax=ax, label="anomaly risk score")
+                    fig.tight_layout()
+                    p = plot_dir / "03_top_ecgi_feature_heatmap.png"
+                    fig.savefig(p, dpi=160, bbox_inches="tight")
+                    plt.close(fig)
+                    images.append(("Top ECGI-feature heatmap", str(p.relative_to(out_dir))))
+
+        # 4) History story plots.
+        stories, pairs = _selected_pairs_for_stories(dataset, int(getattr(args, "plot_story_count", 5)))
+        input_file = analysis_info.get("input_file", "")
+        hist = pd.DataFrame()
+        if input_file and pairs:
+            try:
+                base.log(f"Querying daily history for {len(pairs):,} ECGI-feature plot pair(s)", indent=1)
+                hist = _query_daily_history_for_pairs(Path(input_file), analysis_info, args, pairs)
+                hist.to_csv(out_dir / "cesmlc_v71_plot_daily_history_selected.csv", index=False)
+            except Exception as exc:
+                base.log(f"Could not query daily history for story plots: {exc}", indent=1)
+                base.log(traceback.format_exc().splitlines()[-1], indent=2)
+        story_rows = []
+        if not hist.empty:
+            for i, story in enumerate(stories, start=1):
+                p = plot_dir / f"04_story_{i:02d}_abnormal_vs_lowrisk.png"
+                if _plot_story_comparison(story, hist, p):
+                    images.append((f"Story {i}: abnormal vs low-risk regular change", str(p.relative_to(out_dir))))
+                    story_rows.append(
+                        {
+                            "story": i,
+                            "abnormal_ecgi": story["abnormal"].get("ECGI"),
+                            "abnormal_feature": story["abnormal"].get("FEATURE"),
+                            "abnormal_cluster": story["abnormal"].get("PRIMARY_ANOMALY_CLUSTER"),
+                            "abnormal_risk": story["abnormal"].get("ANOMALY_RISK_SCORE"),
+                            "low_risk_ecgi": story["low_risk"].get("ECGI"),
+                            "low_risk_feature": story["low_risk"].get("FEATURE"),
+                            "low_risk_cluster": story["low_risk"].get("PRIMARY_ANOMALY_CLUSTER"),
+                            "low_risk_risk": story["low_risk"].get("ANOMALY_RISK_SCORE"),
+                            "plot_file": str(p.relative_to(out_dir)),
+                        }
+                    )
+            pd.DataFrame(story_rows).to_csv(out_dir / "cesmlc_v71_story_examples.csv", index=False)
+
+            # Multi-feature story plots for up to N ECGIs.
+            mcount = int(getattr(args, "plot_ecgi_multifeature_count", 5))
+            if mcount > 0:
+                abnormal = dataset[dataset.get("ABNORMAL_FEATURE_FLAG", 0) == 1].copy()
+                candidate_ecgis = (
+                    abnormal.groupby("ECGI").filter(lambda x: x["FEATURE"].nunique() >= 2)["ECGI"].drop_duplicates().head(mcount).tolist()
+                    if not abnormal.empty
+                    else []
+                )
+                for j, ecgi in enumerate(candidate_ecgis, start=1):
+                    rows = abnormal[abnormal["ECGI"] == ecgi].sort_values("ANOMALY_RISK_SCORE", ascending=False).head(3)
+                    p = plot_dir / f"05_multifeature_ecgi_{j:02d}_{_safe_filename(ecgi, 40)}.png"
+                    if _plot_multifeature_ecgi(ecgi, rows, hist, p):
+                        images.append((f"Multi-feature ECGI story {j}", str(p.relative_to(out_dir))))
+
+        # HTML visual report.
+        html_lines = [
+            "<!doctype html>",
+            "<html><head><meta charset='utf-8'><title>CESMLC V7.1 Visual Report</title>",
+            "<style>body{font-family:Arial, sans-serif; margin:24px;} img{max-width:100%; border:1px solid #ddd; margin:8px 0 28px 0;} .card{margin-bottom:36px;} code{background:#f4f4f4; padding:2px 4px;}</style>",
+            "</head><body>",
+            "<h1>CESMLC V7.1 Visual Report</h1>",
+            f"<p>Window: <code>{html.escape(str(analysis_info.get('window_start_date','')))}</code> to <code>{html.escape(str(analysis_info.get('window_end_date','')))}</code></p>",
+        ]
+        for title, rel in images:
+            html_lines.append(f"<div class='card'><h2>{html.escape(title)}</h2><img src='{html.escape(rel)}'></div>")
+        html_lines.append("</body></html>")
+        (out_dir / "cesmlc_v71_visual_report.html").write_text("\n".join(html_lines), encoding="utf-8")
+        base.log(f"Wrote V7.1 visual report: {out_dir / 'cesmlc_v71_visual_report.html'}", indent=1)
+    except Exception as exc:
+        base.log(f"V7.1 plotting failed but main outputs were written. Error: {exc}", indent=1)
+        base.log(traceback.format_exc().splitlines()[-1], indent=2)
+
+
+# ---------------------------------------------------------------------------
+# Output override
+# ---------------------------------------------------------------------------
+
+
+def write_outputs(
+    out_dir: Path,
+    analysis_info: Dict[str, Any],
+    args: argparse.Namespace,
+    candidates: pd.DataFrame,
+    dataset: pd.DataFrame,
+    ecgi_summary: pd.DataFrame,
+    issue_summary: pd.DataFrame,
+    changes: pd.DataFrame,
+    conflicts: pd.DataFrame,
+) -> None:
+    # First run the original writer so all legacy CSVs continue to exist.
+    ORIG_WRITE_OUTPUTS(out_dir, analysis_info, args, candidates, dataset, ecgi_summary, issue_summary, changes, conflicts)
+
+    base.header("PHASE 1H - WRITE V7.1 CLUSTERED REPORTS AND VISUALS")
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    dataset.to_csv(out_dir / "cesmlc_v71_feature_incidents_with_clusters_all.csv", index=False)
+    abnormal = dataset[(dataset.get("ABNORMAL_FEATURE_FLAG", 0) == 1)].sort_values("ANOMALY_RISK_SCORE", ascending=False) if not dataset.empty else pd.DataFrame()
+    abnormal.to_csv(out_dir / "cesmlc_v71_feature_incidents_reportable_all.csv", index=False)
+    abnormal.head(int(getattr(args, "top_n_features", 2000))).to_csv(out_dir / "cesmlc_v71_feature_incidents_reportable_top.csv", index=False)
+
+    if not ecgi_summary.empty:
+        ecgi_summary.to_csv(out_dir / "cesmlc_v71_clustered_ecgi_incident_summary_all.csv", index=False)
+        ecgi_summary.head(int(getattr(args, "top_n", 300))).to_csv(out_dir / "cesmlc_v71_clustered_ecgi_incident_summary_top.csv", index=False)
+        cols = [
+            "INCIDENT_RANK",
+            "ECGI",
+            "ECGI_LABEL",
+            "PRIMARY_ANOMALY_CLUSTER",
+            "PRIMARY_ABNORMAL_FEATURE",
+            "ECGI_ANOMALY_RISK_SCORE",
+            "ABNORMAL_FEATURE_COUNT",
+            "ABNORMAL_DAYS_TOTAL",
+            "ABNORMAL_DAYS_MAX",
+            "ABNORMAL_DAYS_AND_AMOUNTS",
+            "TOP_FEATURE_INCIDENTS",
+            "SERVER_ID",
+            "REGION",
+            "MARKET",
+            "RECOMMENDED_ACTION",
+        ]
+        ecgi_summary[[c for c in cols if c in ecgi_summary.columns]].to_csv(out_dir / "cesmlc_v71_abnormal_days_amounts_by_ecgi.csv", index=False)
+    else:
+        pd.DataFrame().to_csv(out_dir / "cesmlc_v71_clustered_ecgi_incident_summary_all.csv", index=False)
+        pd.DataFrame().to_csv(out_dir / "cesmlc_v71_abnormal_days_amounts_by_ecgi.csv", index=False)
+
+    # Cluster-feature cross tab.
+    if not abnormal.empty:
+        cluster_feature = (
+            abnormal.groupby(["PRIMARY_ANOMALY_CLUSTER", "PRIMARY_ABNORMAL_FEATURE"], dropna=False)
+            .agg(
+                ROW_COUNT=("ECGI", "size"),
+                ECGI_COUNT=("ECGI", "nunique"),
+                AVG_RISK=("ANOMALY_RISK_SCORE", "mean"),
+                MAX_RISK=("ANOMALY_RISK_SCORE", "max"),
+                ABNORMAL_DAYS=("ABNORMAL_DAYS_COUNT", "sum"),
+            )
+            .reset_index()
+            .sort_values(["MAX_RISK", "ECGI_COUNT"], ascending=False)
+        )
+        cluster_feature.to_csv(out_dir / "cesmlc_v71_cluster_feature_summary.csv", index=False)
+    else:
+        pd.DataFrame().to_csv(out_dir / "cesmlc_v71_cluster_feature_summary.csv", index=False)
+
+    write_v71_final_report(out_dir, analysis_info, args, ecgi_summary, dataset)
+    make_v71_plots(out_dir, analysis_info, args, dataset, ecgi_summary)
+
+    base.log(f"Open V7.1 final report: {out_dir / 'cesmlc_v71_final_report_top100_by_cluster.md'}", indent=1)
+    base.log(f"Open V7.1 visual report: {out_dir / 'cesmlc_v71_visual_report.html'}", indent=1)
+    base.log(f"Open V7.1 top CSV: {out_dir / 'cesmlc_v71_clustered_ecgi_incident_summary_top.csv'}", indent=1)
+
+
+# ---------------------------------------------------------------------------
+# Argument parser: original V7 args + V7.1 additions
+# ---------------------------------------------------------------------------
+
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="CESMLC V7.1 hybrid signature + unsupervised anomaly detector.")
+    p.add_argument("--input", required=True, type=str, help="Raw CESMLC CSV input.")
+    p.add_argument("--days", default=30, type=int, help="Analysis window length ending at --end-date or max LOAD_DATE.")
+    p.add_argument("--end-date", default=None, type=str, help="Optional candidate/latest date YYYY-MM-DD. Default: max parsed LOAD_DATE.")
+    p.add_argument("--out-dir", default=None, type=str, help="Output folder.")
+    p.add_argument("--server-id", default=None, type=str, help="Optional SERVER_ID filter for latest-day candidate extraction.")
+    p.add_argument("--include-features", default=",".join(base.DEFAULT_FEATURES), type=str, help="Comma-separated source/current feature columns to analyze.")
+    p.add_argument("--exclude-features", default=None, type=str, help="Comma-separated features to exclude.")
+    p.add_argument("--defaults-json", default=None, type=str, help="Optional JSON overriding default values, valid ranges, and criticality weights.")
+
+    p.add_argument("--reference-source-dir", default=None, type=str, help="Folder containing optional RAN reference CSVs.")
+    p.add_argument("--atoll-master-4g", default=None, type=str, help="Optional path to atoll_master_4g.csv.")
+    p.add_argument("--ericsson-5g-master-data", default=None, type=str, help="Optional path to ericsson_5g_master_data.csv.")
+    p.add_argument("--cssng-data-addition", default=None, type=str, help="Optional path to cssng_data_addition.csv.")
+    p.add_argument("--atoll-cells5g", default=None, type=str, help="Optional path to atoll_cells5g.csv.")
+    p.add_argument("--reference-mapping-json", default=None, type=str, help="Optional JSON mapping CESMLC feature names to reference-source columns.")
+    p.add_argument("--disable-reference-compatibility", action="store_true", help="Skip RAN reference-source compatibility even if files are provided.")
+    p.add_argument("--reference-numeric-tolerance", default=0.00005, type=float)
+    p.add_argument("--long-term-default-days", default=7, type=int)
+    p.add_argument("--sitewide-default-feature-threshold", default=4, type=int)
+    p.add_argument("--sitewide-default-ratio-threshold", default=0.50, type=float)
+
+    p.add_argument("--enable-db-push-check", action="store_true", help="Use FEATURE_DB columns only for narrow AUDIT_PUSH_NOT_APPLIED seed/check.")
+    p.add_argument("--push-source-stable-days", default=2, type=int)
+    p.add_argument("--push-mismatch-days", default=2, type=int)
+
+    p.add_argument("--latlon-decimals", default=5, type=int)
+    p.add_argument("--feature-batch-size", default=1, type=int)
+    p.add_argument("--threads", default=1, type=int)
+    p.add_argument("--memory-limit", default="6GB", type=str)
+    p.add_argument("--duckdb-file", default=None, type=str)
+    p.add_argument("--duckdb-temp-dir", default=None, type=str)
+    p.add_argument("--keep-duckdb", action="store_true")
+
+    p.add_argument("--reuse-history-cache", action="store_true")
+    p.add_argument("--force-rebuild-history-cache", action="store_true")
+    p.add_argument("--history-cache-dir", default=None, type=str)
+    p.add_argument(
+        "--cache-match-mode",
+        default="compatible",
+        choices=["strict", "compatible", "loose", "trust_existing"],
+        help="strict compares file mtime/size; compatible ignores mtime; loose ignores file identity; trust_existing loads any schema-valid cache.",
+    )
+    p.add_argument(
+        "--cache-input-identity",
+        default="basename",
+        choices=["exact", "basename", "none"],
+        help="For compatible cache matching, compare exact input path, basename, or no input identity.",
+    )
+
+    p.add_argument("--enable-isolation-forest", action="store_true")
+    p.add_argument("--isolation-fit-sample", default=300000, type=int)
+    p.add_argument("--isolation-n-estimators", default=200, type=int)
+    p.add_argument("--isolation-top-percentile", default=98.0, type=float)
+    p.add_argument("--isolation-score-weight", default=0.10, type=float)
+    p.add_argument("--isolation-score-batch-size", default=250000, type=int)
+    p.add_argument("--isolation-contamination", default="auto", type=str)
+    p.add_argument("--disable-featurewise-isolation", action="store_true")
+    p.add_argument("--featurewise-isolation-fit-sample", default=100000, type=int)
+    p.add_argument("--featurewise-isolation-min-rows", default=2000, type=int)
+    p.add_argument("--disable-unsupervised-promotions", action="store_true")
+    p.add_argument("--unsupervised-min-rule-score", default=18.0, type=float)
+    p.add_argument("--unsupervised-min-changed-days", default=2, type=int)
+    p.add_argument("--unsupervised-min-distinct-values", default=2, type=int)
+
+    p.add_argument("--high-frequency-days", default=5, type=int)
+    p.add_argument("--high-frequency-distinct-values", default=3, type=int)
+    p.add_argument("--high-frequency-max-mode-share", default=85.0, type=float)
+    p.add_argument("--persistent-days", default=10, type=int)
+    p.add_argument("--min-reverses-for-backforth", default=2, type=int)
+    p.add_argument("--min-aba-for-backforth", default=2, type=int)
+    p.add_argument("--default-min-days", default=2, type=int)
+    p.add_argument("--stable-change-suppress-days", default=5, type=int)
+    p.add_argument("--bulk-change-ratio-threshold", default=0.25, type=float)
+    p.add_argument("--coordinated-feature-threshold", default=4, type=int)
+    p.add_argument("--min-report-score", default=35.0, type=float)
+    p.add_argument("--min-seed-confidence-for-training", default=0.65, type=float)
+
+    p.add_argument("--top-n", default=300, type=int)
+    p.add_argument("--top-n-features", default=2000, type=int)
+    p.add_argument("--evidence-top-n", default=2000, type=int)
+    p.add_argument("--manual-report-top-n", default=100, type=int)
+    p.add_argument("--manual-review-top-n", default=500, type=int)
+    p.add_argument("--manual-review-random-n", default=500, type=int)
+    p.add_argument("--final-report-top-n", default=100, type=int)
+    p.add_argument("--cluster-report-top-n", default=30, type=int)
+    p.add_argument("--disable-plots", action="store_true")
+    p.add_argument("--plot-story-count", default=5, type=int)
+    p.add_argument("--plot-ecgi-multifeature-count", default=5, type=int)
+    p.add_argument("--plot-top-ecgis", default=30, type=int)
+    p.add_argument("--plot-top-features", default=14, type=int)
+    p.add_argument("--random-state", default=42, type=int)
+    return p.parse_args()
+
+
+# ---------------------------------------------------------------------------
+# Monkey patch existing V7 module and run its main pipeline
+# ---------------------------------------------------------------------------
+
+
+def patch_base_module() -> None:
+    base.SCRIPT_VERSION = SCRIPT_VERSION
+    base.manifest_hash = manifest_hash
+    base.cache_manifest_for_run = cache_manifest_for_run
+    base.load_history_cache_if_valid = load_history_cache_if_valid
+    base.save_history_cache = save_history_cache
+    base.add_isolation_forest_scores = add_isolation_forest_scores
+    base.build_training_dataset = build_training_dataset
+    base.build_ecgi_summary = build_ecgi_summary
+    base.write_outputs = write_outputs
+    base.write_manual_markdown = write_manual_markdown
+    base.parse_args = parse_args
+
+
+def main() -> int:
+    patch_base_module()
+    return base.main()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
